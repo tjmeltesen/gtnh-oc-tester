@@ -219,9 +219,97 @@ class SchemaRegistry:
 
 _DEFAULT_REGISTRY: Optional[SchemaRegistry] = None
 
+DEFAULT_VALIDATED_SIMULATOR_TYPES: Tuple[str, ...] = (
+    "me_controller",
+    "me_interface",
+    "fluid_interface",
+    "gt_machine",
+    "gt_batterybuffer",
+    "transposer",
+    "inventory_controller",
+    "tank_controller",
+    "redstone",
+    "database",
+    "filesystem",
+    "eeprom",
+    "gpu",
+    "screen",
+    "computer",
+)
+
 
 def get_default_registry() -> SchemaRegistry:
     global _DEFAULT_REGISTRY
     if _DEFAULT_REGISTRY is None:
         _DEFAULT_REGISTRY = SchemaRegistry()
     return _DEFAULT_REGISTRY
+
+
+def validate_simulator_dumps(
+    registry: Optional[SchemaRegistry] = None,
+    component_types: Tuple[str, ...] = DEFAULT_VALIDATED_SIMULATOR_TYPES,
+    hosts: Tuple[str, ...] = ("computer", "robot", "tablet"),
+    require_explicit_impl: bool = False,
+    strict: bool = False,
+) -> Dict[str, Any]:
+    """Validate that simulator components expose all method names and docstrings from GTNH dumps.
+
+    Returns a dictionary report containing `valid: bool`, `all_valid: bool`,
+    `checked_components: int`, `checked_count: int`, `checked_methods: int`,
+    `missing_methods: List[str]`, `mismatched_docs: List[str]`, and `missing_impls: List[str]`.
+    """
+    from ..components.bus import ComponentBus
+
+    if strict:
+        require_explicit_impl = True
+
+    reg = registry or get_default_registry()
+    missing_methods: List[str] = []
+    mismatched_docs: List[str] = []
+    missing_impls: List[str] = []
+    checked_components = 0
+    checked_methods = 0
+
+    for host in hosts:
+        bus = ComponentBus(host=host, registry=reg)
+        for ctype in component_types:
+            dumps = reg.dumps_by_host_type.get((host, ctype), [])
+            if not dumps:
+                continue
+            for dspec in dumps:
+                checked_components += 1
+                comp = bus.attach(ctype, variant=dspec.dump_name)
+                exposed = comp.get_exposed_methods()
+                for mname, dmethod in dspec.methods.items():
+                    checked_methods += 1
+                    if mname not in exposed:
+                        missing_methods.append(f"{host}/{dspec.dump_name}.{mname}")
+                    doc = comp.get_doc(mname)
+                    if doc != dmethod.raw_doc:
+                        mismatched_docs.append(
+                            f"{host}/{dspec.dump_name}.{mname}: expected {dmethod.raw_doc!r}, got {doc!r}"
+                        )
+                    if require_explicit_impl and not (
+                        hasattr(comp, f"_impl_{mname}") or hasattr(comp, mname)
+                    ):
+                        missing_impls.append(f"{host}/{dspec.dump_name}.{mname}")
+
+    valid = not missing_methods and not mismatched_docs and (
+        not require_explicit_impl or not missing_impls
+    )
+    if strict and not valid:
+        raise AssertionError(
+            f"Simulator dump validation failed: missing_methods={missing_methods}, "
+            f"mismatched_docs={mismatched_docs}, missing_impls={missing_impls}"
+        )
+    return {
+        "valid": valid,
+        "all_valid": valid,
+        "checked_components": checked_components,
+        "checked_count": checked_components,
+        "checked_methods": checked_methods,
+        "missing_methods": missing_methods,
+        "mismatched_docs": mismatched_docs,
+        "missing_impls": missing_impls,
+    }
+

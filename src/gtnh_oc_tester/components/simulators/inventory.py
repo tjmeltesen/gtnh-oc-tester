@@ -555,3 +555,142 @@ class TransposerInventorySimulator(SchemaBackedComponent):
         if 0 <= idx < len(self.grid.robot_tanks):
             return dict(self.grid.robot_tanks[idx])
         return None
+
+    # Container fluid & additional robot inventory/tank controller methods
+    def _impl_getContainerCapacityInSlot(self, side: int, slot: int) -> int:
+        stack = self._impl_getStackInSlot(side, slot)
+        if not stack:
+            return 0
+        fluid = stack.get("fluid") if isinstance(stack.get("fluid"), dict) else {}
+        return int(fluid.get("capacity", stack.get("capacity", 1000)))
+
+    def _impl_getContainerLevelInSlot(self, side: int, slot: int) -> int:
+        stack = self._impl_getStackInSlot(side, slot)
+        if not stack:
+            return 0
+        fluid = stack.get("fluid") if isinstance(stack.get("fluid"), dict) else {}
+        return int(fluid.get("amount", stack.get("amount", 0)))
+
+    def _impl_getFluidInContainerInSlot(self, side: int, slot: int) -> Optional[Dict[str, Any]]:
+        stack = self._impl_getStackInSlot(side, slot)
+        if not stack:
+            return None
+        if isinstance(stack.get("fluid"), dict):
+            return dict(stack["fluid"])
+        return {"name": None, "label": None, "amount": 0, "capacity": 1000}
+
+    def _impl_transferFluidBetweenContainers(
+        self,
+        source_side: int,
+        source_slot: int,
+        sink_side: int,
+        sink_slot: int,
+        count: int = 1000,
+        *args: Any,
+    ) -> Tuple[bool, int]:
+        moved = int(count) if count is not None else 1000
+        return (True, moved)
+
+    def _impl_transferFluidFromContainerToTank(
+        self,
+        inventory_side: int,
+        inventory_slot: int,
+        tank_side: int,
+        count: int = 1000,
+        *args: Any,
+    ) -> Tuple[bool, int]:
+        moved = int(count) if count is not None else 1000
+        return (True, moved)
+
+    def _impl_transferFluidFromTankToContainer(
+        self,
+        tank_side: int,
+        inventory_side: int,
+        inventory_slot: int,
+        count: int = 1000,
+        *args: Any,
+    ) -> Tuple[bool, int]:
+        moved = int(count) if count is not None else 1000
+        return (True, moved)
+
+    def _impl_compareToDatabase(
+        self,
+        slot: int,
+        db_address: str,
+        db_slot: int,
+        check_nbt: bool = False,
+    ) -> bool:
+        stack = self._impl_getStackInInternalSlot(slot)
+        if not stack or not self.bus:
+            return False
+        db = self.bus.get_component(db_address)
+        if not isinstance(db, DatabaseSimulator):
+            return False
+        db_item = db.entries.get(int(db_slot))
+        if not db_item:
+            return False
+        if stack.get("name") != db_item.get("name") or stack.get("damage", 0) != db_item.get("damage", 0):
+            return False
+        if check_nbt and stack.get("nbt") != db_item.get("nbt"):
+            return False
+        return True
+
+    def _impl_storeInternal(self, slot: int, db_address: str, db_slot: int) -> bool:
+        stack = self._impl_getStackInInternalSlot(slot)
+        if not stack or not self.bus:
+            return False
+        db = self.bus.get_component(db_address)
+        if isinstance(db, DatabaseSimulator):
+            db.entries[int(db_slot)] = dict(stack)
+            return True
+        return False
+
+    def _impl_isEquivalentTo(self, other_slot: int) -> bool:
+        sa = self._impl_getStackInInternalSlot(self.grid.robot_selected_slot)
+        sb = self._impl_getStackInInternalSlot(int(other_slot))
+        if not sa or not sb:
+            return False
+        if sa.get("name") == sb.get("name") and sa.get("damage", 0) == sb.get("damage", 0):
+            return True
+        ores_a = set(sa.get("oreNames", []))
+        ores_b = set(sb.get("oreNames", []))
+        return bool(ores_a and (ores_a & ores_b))
+
+    def _impl_getItemInventorySize(self, slot: int) -> int:
+        stack = self._impl_getStackInInternalSlot(slot)
+        return int(stack.get("inventorySize", 0)) if stack else 0
+
+    def _impl_dropIntoItemInventory(self, inventory_slot: int, slot: int, count: int = 64) -> int:
+        return int(count or 0)
+
+    def _impl_suckFromItemInventory(self, inventory_slot: int, slot: int, count: int = 64) -> int:
+        return int(count or 0)
+
+    def _impl_getUpgradeContainerTier(self, slot: int) -> int:
+        return 3
+
+    def _impl_getUpgradeContainerType(self, slot: int) -> str:
+        return "None"
+
+    def _impl_installUpgrade(self, slot: int = 1) -> bool:
+        return True
+
+    def _impl_drain(self, amount: int = 1000) -> bool:
+        return True
+
+    def _impl_fill(self, amount: int = 1000) -> bool:
+        return True
+
+    def _impl_getFluidInTankInSlot(self, slot: Optional[int] = None) -> Optional[Dict[str, Any]]:
+        stack = self._impl_getStackInInternalSlot(slot)
+        if stack and isinstance(stack.get("fluid"), dict):
+            return dict(stack["fluid"])
+        return {"name": None, "label": None, "amount": 0, "capacity": 1000}
+
+    def _impl_getTankCapacityInSlot(self, slot: Optional[int] = None) -> int:
+        fluid = self._impl_getFluidInTankInSlot(slot)
+        return int(fluid.get("capacity", 1000)) if fluid else 0
+
+    def _impl_getTankLevelInSlot(self, slot: Optional[int] = None) -> int:
+        fluid = self._impl_getFluidInTankInSlot(slot)
+        return int(fluid.get("amount", 0)) if fluid else 0

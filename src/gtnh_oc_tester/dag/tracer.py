@@ -123,33 +123,8 @@ class ExecutionTracer:
     def _install_lua_hook(self) -> None:
         if self.sandbox is None:
             return
-        self.sandbox.lua.globals()["__oc_trace_fn"] = self.record_user_function
-        self.sandbox.lua.execute(
-            r"""
-            if debug and debug.sethook then
-              local _ignored = {
-                checkArg = true, pairs = true, ipairs = true, next = true,
-                tostring = true, tonumber = true, type = true, select = true,
-                unpack = true, pcall = true, xpcall = true, require = true,
-                load = true, loadfile = true, dofile = true, setmetatable = true,
-                getmetatable = true, rawget = true, rawset = true, error = true,
-                assert = true, print = true,
-              }
-              debug.sethook(function(event)
-                if event ~= "call" then return end
-                local info = debug.getinfo(2, "nSl")
-                if not info or info.what ~= "Lua" then return end
-                local name = info.name
-                local src = info.source or ""
-                if name and not _ignored[name] and not name:match("^_") then
-                  if src:match("^=script") or src:match("^=/home/") or src:match("_spec%.lua") then
-                    __oc_trace_fn(name, src:sub(2), info.linedefined or 0)
-                  end
-                end
-              end, "c")
-            end
-            """
-        )
+        raw_lua = getattr(self.sandbox.lua, "raw_lua", self.sandbox.lua)
+        raw_lua.globals()["__oc_trace_fn"] = self.record_user_function
 
     def _on_component_call(self, rec: ComponentCallRecord) -> None:
         # Avoid cluttering trace with internal per-cell GPU draws unless explicitly desired

@@ -137,6 +137,30 @@ def render_screen_html(
 """
 
 
+class FontHexRenderer:
+    """Loads OpenComputers `font.hex` glyphs (8x16 narrow and 16x16 wide) and renders screen buffers."""
+
+    CELL_WIDTH = 8
+    CELL_HEIGHT = 16
+
+    def __init__(self, jar_loader: Optional[OCJarLoader] = None) -> None:
+        self.jar_loader = jar_loader or OCJarLoader()
+        self.glyphs: Dict[int, bytes] = self.jar_loader.load_font_hex()
+
+    def get_glyph(self, char_or_cp: int | str) -> bytes:
+        if isinstance(char_or_cp, str):
+            cp = ord(char_or_cp[0]) if char_or_cp else 32
+        else:
+            cp = int(char_or_cp)
+        return self.glyphs.get(cp) or self.glyphs.get(32) or bytes(16)
+
+    def is_wide_glyph(self, char_or_cp: int | str) -> bool:
+        return len(self.get_glyph(char_or_cp)) == 32
+
+    def cell_width(self, char_or_cp: int | str) -> int:
+        return 2 if self.is_wide_glyph(char_or_cp) else 1
+
+
 def render_screen_png(
     emulator: GPUScreenEmulator,
     output_path: str | Path,
@@ -144,12 +168,12 @@ def render_screen_png(
     scale: int = 2,
 ) -> Path:
     """Render the GPU screen buffer to a pixel-accurate PNG using OpenComputers `font.hex`."""
-    loader = jar_loader or OCJarLoader()
-    glyphs: Dict[int, bytes] = loader.load_font_hex()
+    font_renderer = FontHexRenderer(jar_loader=jar_loader or emulator.jar_loader)
+    glyphs = font_renderer.glyphs
     page = emulator.screen_page
 
-    char_w = 8
-    char_h = 16
+    char_w = FontHexRenderer.CELL_WIDTH
+    char_h = FontHexRenderer.CELL_HEIGHT
     bezel = 12
     screen_px_w = page.width * char_w
     screen_px_h = page.height * char_h
@@ -170,39 +194,46 @@ def render_screen_png(
     pixels = img.load()
     assert pixels is not None
 
-    for ry in range(page.height):
-        row = page.cells[ry]
-        py_base = bezel + ry * char_h
-        for rx in range(page.width):
-            cell = row[rx]
-            px_base = bezel + rx * char_w
-            fg_rgb = _int_to_rgb(cell.fg)
-            bg_rgb = _int_to_rgb(cell.bg)
-            cp = ord(cell.char[0]) if cell.char else 32
-            glyph = glyphs.get(cp) or glyphs.get(32)
+    if emulator.screen_on:
+        for ry in range(page.height):
+            row = page.cells[ry]
+            py_base = bezel + ry * char_h
+            skip_next = False
+            for rx in range(page.width):
+                if skip_next:
+                    skip_next = False
+                    continue
+                cell = row[rx]
+                px_base = bezel + rx * char_w
+                fg_rgb = _int_to_rgb(cell.fg)
+                bg_rgb = _int_to_rgb(cell.bg)
+                cp = ord(cell.char[0]) if cell.char else 32
+                glyph = glyphs.get(cp) or glyphs.get(32)
 
-            if not glyph or (cp == 32 and cell.bg == 0x000000):
-                if cell.bg != 0x000000:
+                if not glyph or (cp == 32 and cell.bg == 0x000000):
+                    if cell.bg != 0x000000:
+                        for gy in range(char_h):
+                            for gx in range(char_w):
+                                pixels[px_base + gx, py_base + gy] = bg_rgb
+                    continue
+
+                if len(glyph) == 32:
+                    max_gx = 16 if (rx + 1 < page.width) else 8
+                    if rx + 1 < page.width and row[rx + 1].char in (" ", ""):
+                        skip_next = True
                     for gy in range(char_h):
-                        for gx in range(char_w):
-                            pixels[px_base + gx, py_base + gy] = bg_rgb
-                continue
-
-            bytes_per_row = 2 if len(glyph) == 32 else 1
-            for gy in range(char_h):
-                if bytes_per_row == 1:
-                    row_bits = glyph[gy] if gy < len(glyph) else 0
-                    for gx in range(char_w):
-                        bit_on = (row_bits >> (7 - gx)) & 1
-                        pixels[px_base + gx, py_base + gy] = fg_rgb if bit_on else bg_rgb
+                        hi = glyph[gy * 2] if gy * 2 < len(glyph) else 0
+                        lo = glyph[gy * 2 + 1] if gy * 2 + 1 < len(glyph) else 0
+                        word = (hi << 8) | lo
+                        for gx in range(max_gx):
+                            bit_on = (word >> (15 - gx)) & 1
+                            pixels[px_base + gx, py_base + gy] = fg_rgb if bit_on else bg_rgb
                 else:
-                    hi = glyph[gy * 2] if gy * 2 < len(glyph) else 0
-                    lo = glyph[gy * 2 + 1] if gy * 2 + 1 < len(glyph) else 0
-                    word = (hi << 8) | lo
-                    for gx in range(char_w):
-                        # Sample 8 columns across the 16-bit glyph or left 8 bits
-                        bit_on = ((word >> (15 - gx * 2)) & 1) or ((word >> (14 - gx * 2)) & 1)
-                        pixels[px_base + gx, py_base + gy] = fg_rgb if bit_on else bg_rgb
+                    for gy in range(char_h):
+                        row_bits = glyph[gy] if gy < len(glyph) else 0
+                        for gx in range(char_w):
+                            bit_on = (row_bits >> (7 - gx)) & 1
+                            pixels[px_base + gx, py_base + gy] = fg_rgb if bit_on else bg_rgb
 
     if scale > 1:
         img = img.resize((img_w * int(scale), img_h * int(scale)), Image.Resampling.NEAREST)

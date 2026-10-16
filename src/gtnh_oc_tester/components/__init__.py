@@ -3,6 +3,18 @@
 from .abstracts import DriverAbstractMixin
 from .auto_mock import ComponentCallRecord, SchemaBackedComponent
 from .bus import ComponentBus
+from .oc_components import (
+    ComputerComponent,
+    DataCardComponent,
+    DriveComponent,
+    EEPROMComponent,
+    FilesystemComponent,
+    InternetComponent,
+    KeyboardComponent,
+    MockInternetHandle,
+    ModemComponent,
+    SoundCardComponent,
+)
 from .simulators import (
     AE2NetworkComponent,
     AECraftableRecipe,
@@ -23,13 +35,23 @@ __all__ = [
     "AECraftingJobState",
     "ComponentBus",
     "ComponentCallRecord",
+    "ComputerComponent",
+    "DataCardComponent",
     "DatabaseSimulator",
+    "DriveComponent",
     "DriverAbstractMixin",
+    "EEPROMComponent",
+    "FilesystemComponent",
     "GTMachineSimulator",
+    "InternetComponent",
+    "KeyboardComponent",
     "MENetworkState",
+    "MockInternetHandle",
+    "ModemComponent",
     "RedstoneSimulator",
     "SchemaBackedComponent",
     "SideInventoryState",
+    "SoundCardComponent",
     "StackSlotUserdata",
     "TransposerInventorySimulator",
     "WorldInventoryGrid",

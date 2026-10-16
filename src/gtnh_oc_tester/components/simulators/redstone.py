@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Any, Dict, Optional
 
 from ..auto_mock import SchemaBackedComponent
+from .ae2 import _lua_to_py
 
 
 class RedstoneSimulator(SchemaBackedComponent):
@@ -74,11 +75,7 @@ class RedstoneSimulator(SchemaBackedComponent):
         return int(self.outputs.get(int(side), 0))
 
     def _impl_setOutput(self, side_or_table: Any, value: Optional[int] = None) -> Any:
-        arg = (
-            self.bus.sandbox.lua_to_python(side_or_table)
-            if (self.bus and self.bus.sandbox and value is None)
-            else side_or_table
-        )
+        arg = _lua_to_py(side_or_table, self.bus) if value is None else side_or_table
         if isinstance(arg, dict):
             old_all = dict(self.outputs)
             for s, v in arg.items():
@@ -122,11 +119,7 @@ class RedstoneSimulator(SchemaBackedComponent):
             old_val = self.bundled_outputs[s].get(c, 0)
             self.bundled_outputs[s][c] = int(value)
             return old_val
-        s_arg = (
-            self.bus.sandbox.lua_to_python(side_or_table)
-            if (self.bus and self.bus.sandbox)
-            else side_or_table
-        )
+        s_arg = _lua_to_py(side_or_table, self.bus)
         if isinstance(s_arg, dict):
             old_all = {s: dict(cmap) for s, cmap in self.bundled_outputs.items()}
             for s, cmap in s_arg.items():
@@ -136,11 +129,7 @@ class RedstoneSimulator(SchemaBackedComponent):
                             self.bundled_outputs[s][c] = int(v)
             return old_all
         s = int(s_arg)
-        c_arg = (
-            self.bus.sandbox.lua_to_python(color_or_table)
-            if (self.bus and self.bus.sandbox)
-            else color_or_table
-        )
+        c_arg = _lua_to_py(color_or_table, self.bus)
         old_side = dict(self.bundled_outputs.get(s, {}))
         if isinstance(c_arg, dict):
             for c, v in c_arg.items():

@@ -8,6 +8,13 @@ on:
 jobs:
   oc-lua-test:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        lua-version: ["5.3", "5.2"]
+    env:
+      SDL_VIDEODRIVER: dummy
+      SDL_AUDIODRIVER: dummy
     steps:
       - uses: actions/checkout@v4
 
@@ -16,17 +23,17 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Install Graphviz and gtnh-oc-tester
+      - name: Install Graphviz, SDL2, and gtnh-oc-tester
         run: |
-          sudo apt-get update -qq && sudo apt-get install -y -qq graphviz
+          sudo apt-get update -qq && sudo apt-get install -y -qq graphviz libsdl2-2.0-0
           pip install gtnh-oc-tester
 
-      - name: Run Python and Pure-Lua OpenComputers Test Suites
+      - name: Run Python and Pure-Lua OpenComputers Test Suites (Lua ${{ matrix.lua-version }})
         run: |
-          gtnh-oc-test --dag-dir ./oc-artifacts
+          gtnh-oc-test --lua-version ${{ matrix.lua-version }} --window --dag-dir ./oc-artifacts-${{ matrix.lua-version }}
 
       - name: Upload Execution DAGs and Screen Snapshots
         uses: actions/upload-artifact@v4
         with:
-          name: oc-execution-dags-and-screens
-          path: ./oc-artifacts/
+          name: oc-execution-dags-and-screens-lua-${{ matrix.lua-version }}
+          path: ./oc-artifacts-${{ matrix.lua-version }}/

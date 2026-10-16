@@ -23,6 +23,7 @@ from .runtime.scheduler import DeterministicScheduler
 from .runtime.vfs import VirtualFileSystem
 from .screen.gpu_buffer import GPUScreenEmulator
 from .specs.jar_loader import OCJarLoader
+from .specs.oc_config import OCMachineConfig, load_oc_config
 from .specs.registry import SchemaRegistry, get_default_registry
 
 
@@ -36,12 +37,46 @@ class OCEnvironment:
         screen_height: int = 25,
         screen_tier: int = 3,
         jar_path: Optional[str | Path] = None,
+        jar_version: str = "1.12.64-GTNH",
+        lua_version: str = "5.3",
+        architecture: Optional[str] = None,
+        cpu_tier: int = 3,
+        ram_tier: int = 6,
+        oc_config: Optional[str | Path | OCMachineConfig] = None,
+        config_path: Optional[str | Path] = None,
+        enforce_call_budget: bool = False,
         registry: Optional[SchemaRegistry] = None,
         trace_lua_functions: bool = True,
     ) -> None:
         self.host = host
+        self.jar_version = str(jar_version or "1.12.64-GTNH")
+
+        raw_arch = str(architecture or lua_version or "5.3").strip()
+        if raw_arch in ("5.2", "Lua 5.2"):
+            norm_arch = "Lua 5.2"
+        elif raw_arch in ("5.3", "Lua 5.3"):
+            norm_arch = "Lua 5.3"
+        else:
+            norm_arch = raw_arch
+
+        if isinstance(oc_config, OCMachineConfig):
+            self.config = oc_config
+        else:
+            cfg_source = oc_config if oc_config is not None else config_path
+            self.config = load_oc_config(
+                cfg_source,
+                architecture=norm_arch,
+                cpu_tier=int(cpu_tier),
+                ram_tier=int(ram_tier),
+            )
+
+        self.lua_version = "5.2" if self.config.architecture == "Lua 5.2" else "5.3"
+        self.cpu_tier = self.config.cpu_tier
+        self.ram_tier = self.config.ram_tier
+        self.enforce_call_budget = bool(enforce_call_budget)
+
         self.registry = registry or get_default_registry()
-        self.jar_loader = OCJarLoader(jar_path=jar_path)
+        self.jar_loader = OCJarLoader(jar_path=jar_path, jar_version=self.jar_version)
         self.screen = GPUScreenEmulator(
             width=screen_width,
             height=screen_height,
@@ -52,8 +87,16 @@ class OCEnvironment:
             host=host,
             jar_loader=self.jar_loader,
             gpu_screen=self.screen,
+            architecture=self.config.architecture,
+            ram_tier=self.config.ram_tier,
+            cpu_tier=self.config.cpu_tier,
+            allow_bytecode=self.config.allow_bytecode,
+            allow_gc=self.config.allow_gc,
+            timeout=self.config.timeout,
+            enforce_call_budget=self.enforce_call_budget,
         )
         self.scheduler: DeterministicScheduler = self.sandbox.scheduler
+        self.scheduler.max_signal_queue_size = self.config.max_signal_queue_size
         self.vfs: VirtualFileSystem = self.sandbox.vfs
 
         self.bus = ComponentBus(
@@ -61,10 +104,13 @@ class OCEnvironment:
             registry=self.registry,
             scheduler=self.scheduler,
             sandbox=self.sandbox,
+            config=self.config,
+            enforce_call_budget=self.enforce_call_budget,
+            vfs=self.vfs,
         )
         self.sandbox.component_bus = self.bus
 
-        # Attach standard base OpenComputers components before binding component library
+        # Attach standard base OpenComputers components on the unified ComponentBus
         self.screen_comp = self.bus.attach(
             "screen",
             address=self.screen.screen_address,
@@ -88,12 +134,25 @@ class OCEnvironment:
             address=self.vfs.root_address,
             slot=1,
             primary=True,
+            vfs=self.vfs,
+            label="OpenOS",
+        )
+        self.tmp_fs_comp = self.bus.attach(
+            "filesystem",
+            address=self.vfs.tmp_address,
+            slot=-1,
+            primary=False,
+            vfs=self.sandbox.machine_host.tmp_vfs,
+            label="tmpfs",
         )
         self.eeprom_comp = self.bus.attach(
             "eeprom",
             address="e0000000-0000-4000-8000-000000000001",
             slot=-1,
             primary=True,
+            data=self.vfs.root_address,
+            max_code_size=self.config.eeprom_size,
+            max_data_size=self.config.eeprom_data_size,
         )
         self.computer_comp = self.bus.attach(
             "computer",
@@ -118,8 +177,6 @@ class OCEnvironment:
 
         # Clear initialization component_added signals from the test signal queue
         self.scheduler.signal_queue.clear()
-
-        self.bus.build_lua_component_library(self.sandbox)
 
         self.tracer = ExecutionTracer(
             sandbox=self.sandbox,

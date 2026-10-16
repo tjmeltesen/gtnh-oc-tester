@@ -2,10 +2,23 @@
 
 from __future__ import annotations
 
+import re
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
+from ..specs.oc_config import OCMachineConfig
 from ..specs.registry import SchemaRegistry, get_default_registry
 from .auto_mock import ComponentCallRecord, SchemaBackedComponent
+from .oc_components import (
+    ComputerComponent,
+    DataCardComponent,
+    DriveComponent,
+    EEPROMComponent,
+    FilesystemComponent,
+    InternetComponent,
+    KeyboardComponent,
+    ModemComponent,
+    SoundCardComponent,
+)
 from .simulators.ae2 import AE2NetworkComponent, MENetworkState
 from .simulators.gregtech import GTMachineSimulator
 from .simulators.inventory import (
@@ -49,6 +62,79 @@ INVENTORY_COMPONENT_TYPES = {
     "tank_controller",
 }
 
+OC_VANILLA_COMPONENT_CLASSES = {
+    "filesystem": FilesystemComponent,
+    "eeprom": EEPROMComponent,
+    "computer": ComputerComponent,
+    "keyboard": KeyboardComponent,
+    "modem": ModemComponent,
+    "internet": InternetComponent,
+    "data": DataCardComponent,
+    "drive": DriveComponent,
+    "sound": SoundCardComponent,
+}
+
+# Known indirect (world/server-thread synchronous) methods in OpenComputers
+INDIRECT_METHODS_BY_TYPE: Dict[str, set[str]] = {
+    "transposer": {
+        "transferItem",
+        "transferFluid",
+        "swap",
+        "setStackDisplayName",
+        "transferFluidBetweenContainers",
+        "transferFluidFromContainerToTank",
+        "transferFluidFromTankToContainer",
+    },
+    "inventory_controller": {
+        "equip",
+        "dropIntoSlot",
+        "suckFromSlot",
+        "dropIntoItemInventory",
+        "suckFromItemInventory",
+        "installUpgrade",
+        "setStackDisplayName",
+    },
+    "tank_controller": {
+        "drain",
+        "fill",
+    },
+    "filesystem": {
+        "makeDirectory",
+        "remove",
+        "rename",
+        "setLabel",
+    },
+    "eeprom": {
+        "set",
+        "setData",
+        "setLabel",
+        "makeReadonly",
+    },
+    "drive": {
+        "setLabel",
+    },
+}
+
+# Known direct call limits (cost = 1.0 / limit) in OpenComputers
+DIRECT_CALL_LIMITS: Dict[Tuple[str, str], float] = {
+    ("gpu", "copy"): 25.0,
+    ("gpu", "fill"): 50.0,
+    ("gpu", "set"): 100.0,
+    ("gpu", "get"): 50.0,
+    ("gpu", "setBackground"): 100.0,
+    ("gpu", "setForeground"): 100.0,
+    ("gpu", "bitblt"): 2.0,
+    ("filesystem", "read"): 15.0,
+    ("filesystem", "seek"): 15.0,
+    ("filesystem", "write"): 5.0,
+    ("filesystem", "open"): 4.0,
+    ("filesystem", "exists"): 20.0,
+    ("filesystem", "isDirectory"): 20.0,
+    ("filesystem", "size"): 20.0,
+    ("filesystem", "lastModified"): 20.0,
+    ("filesystem", "list"): 5.0,
+}
+
 
 class ComponentBus:
     """Central bus connecting emulated GTNH 2.9 components to the OpenComputers Lua sandbox."""
@@ -59,11 +145,26 @@ class ComponentBus:
         registry: Optional[SchemaRegistry] = None,
         scheduler: Optional[Any] = None,
         sandbox: Optional[Any] = None,
+        config: Optional[OCMachineConfig] = None,
+        call_budget_limit: Optional[float] = None,
+        enforce_call_budget: bool = False,
+        vfs: Optional[Any] = None,
     ) -> None:
         self.host = host
         self.registry = registry or get_default_registry()
         self.scheduler = scheduler
         self.sandbox = sandbox
+        self.vfs = vfs
+        self.config = config or OCMachineConfig()
+
+        self.call_budget_limit: float = (
+            float(call_budget_limit)
+            if call_budget_limit is not None
+            else float(self.config.call_budget_per_tick)
+        )
+        self.current_tick_budget_used: float = 0.0
+        self.enforce_call_budget: bool = bool(enforce_call_budget)
+        self.budget_exhaustions: int = 0
 
         self.components: Dict[str, SchemaBackedComponent] = {}
         self.primaries: Dict[str, str] = {}
@@ -77,10 +178,89 @@ class ComponentBus:
             self.scheduler.add_tick_hook(self._on_tick)
 
     def _on_tick(self, current_tick: int) -> None:
+        self.current_tick_budget_used = 0.0
         self.me_network.on_tick(current_tick)
         for comp in list(self.components.values()):
             if hasattr(comp, "on_tick"):
                 comp.on_tick(current_tick)  # type: ignore[attr-defined]
+
+    def reset_call_budget(self) -> None:
+        """Reset the accumulated direct-call budget for the current tick."""
+        self.current_tick_budget_used = 0.0
+
+    def get_method_info(self, address: str, method: str) -> Dict[str, Any]:
+        """Return OpenComputers callback metadata `{"direct": bool, "getter": bool, "setter": bool, "cost": float}`."""
+        comp = self.get_component(str(address))
+        if comp is None:
+            raise KeyError(f"no such component: {address}")
+
+        mname = str(method)
+        ctype = comp.component_type
+        doc = comp.get_doc(mname) or ""
+
+        is_field = mname in comp.extra_fields or mname in comp.schema.dump_fields
+        getter = bool(is_field)
+        setter = bool(is_field and mname == "fsnode")
+
+        # Parse explicit `direct:true/false` and `limit:N` if present in dump doc or method metadata
+        direct = True
+        cost: Optional[float] = None
+
+        m_direct = re.search(r"\bdirect\s*[:=]\s*(true|false)\b", doc, flags=re.IGNORECASE)
+        if m_direct:
+            direct = m_direct.group(1).lower() == "true"
+        elif mname in INDIRECT_METHODS_BY_TYPE.get(ctype, set()):
+            direct = False
+
+        m_limit = re.search(r"\blimit\s*[:=]\s*([-+]?\d*\.?\d+)\b", doc, flags=re.IGNORECASE)
+        if m_limit:
+            lim = float(m_limit.group(1))
+            cost = (1.0 / lim) if lim > 0 else 0.1
+        elif (ctype, mname) in DIRECT_CALL_LIMITS:
+            lim = DIRECT_CALL_LIMITS[(ctype, mname)]
+            cost = (1.0 / lim) if lim > 0 else 0.1
+
+        if not direct:
+            cost = 1.0
+        elif cost is None:
+            cost = 0.1
+
+        return {
+            "direct": bool(direct),
+            "getter": bool(getter),
+            "setter": bool(setter),
+            "cost": float(cost),
+        }
+
+    def consume_call_budget(
+        self,
+        address: str,
+        method: str,
+        advance_tick_on_exhaustion: bool = False,
+    ) -> bool:
+        """Consume call budget for `(address, method)`.
+
+        Returns `True` if the call fits within the current tick's budget and can execute
+        immediately as a direct call, or `False` if the call budget for this tick is
+        exhausted (or the method is indirect), signaling that `machine.lua` should yield
+        and execute on the next tick.
+        """
+        info = self.get_method_info(address, method)
+        if not info["direct"]:
+            if self.enforce_call_budget and advance_tick_on_exhaustion and self.scheduler is not None:
+                self.scheduler.step_ticks(1)
+            return not self.enforce_call_budget
+
+        cost = float(info["cost"])
+        if self.enforce_call_budget and (self.current_tick_budget_used + cost > self.call_budget_limit):
+            self.budget_exhaustions += 1
+            if advance_tick_on_exhaustion and self.scheduler is not None:
+                self.scheduler.step_ticks(1)
+                self.current_tick_budget_used = cost
+            return False
+
+        self.current_tick_budget_used += cost
+        return True
 
     def record_call(self, record: ComponentCallRecord) -> None:
         self.call_log.append(record)
@@ -165,6 +345,17 @@ class ComponentBus:
                 registry=self.registry,
                 bus=self,
             )
+        elif component_type == "gpu":
+            from ..screen.gpu_buffer import GPUComponent, GPUScreenEmulator
+
+            comp = GPUComponent(
+                emulator=GPUScreenEmulator(),
+                address=address,
+                slot=slot,
+                host=self.host,
+                registry=self.registry,
+                bus=self,
+            )
         elif component_type == "screen" and self.sandbox is not None and self.sandbox.gpu_screen is not None:
             from ..screen.gpu_buffer import ScreenComponent
 
@@ -175,6 +366,35 @@ class ComponentBus:
                 host=self.host,
                 registry=self.registry,
                 bus=self,
+            )
+        elif component_type == "screen":
+            from ..screen.gpu_buffer import GPUScreenEmulator, ScreenComponent
+
+            comp = ScreenComponent(
+                emulator=GPUScreenEmulator(),
+                address=address,
+                slot=slot,
+                host=self.host,
+                registry=self.registry,
+                bus=self,
+            )
+        elif component_type in OC_VANILLA_COMPONENT_CLASSES:
+            oc_cls = OC_VANILLA_COMPONENT_CLASSES[component_type]
+            if component_type == "filesystem" and "vfs" not in kwargs:
+                default_vfs = self.vfs or (
+                    getattr(self.sandbox, "vfs", None) if self.sandbox is not None else None
+                )
+                if default_vfs is not None:
+                    kwargs = dict(kwargs, vfs=default_vfs)
+            comp = oc_cls(
+                component_type=component_type,
+                address=address,
+                slot=slot,
+                host=self.host,
+                variant=variant,
+                registry=self.registry,
+                bus=self,
+                **kwargs,
             )
         else:
             comp = SchemaBackedComponent(
@@ -245,6 +465,25 @@ class ComponentBus:
                     out[addr] = c.component_type
         return out
 
+    def validate_simulator_dumps(
+        self,
+        component_types: Optional[Tuple[str, ...]] = None,
+        hosts: Tuple[str, ...] = ("computer", "robot", "tablet"),
+        require_explicit_impl: bool = False,
+    ) -> Dict[str, Any]:
+        """Validate simulator components against GTNH 2.9 dump method names and docstrings."""
+        from ..specs.registry import (
+            DEFAULT_VALIDATED_SIMULATOR_TYPES,
+            validate_simulator_dumps as _validate_dumps,
+        )
+
+        return _validate_dumps(
+            registry=self.registry,
+            component_types=component_types or DEFAULT_VALIDATED_SIMULATOR_TYPES,
+            hosts=hosts,
+            require_explicit_impl=require_explicit_impl,
+        )
+
     def build_lua_component_library(self, sandbox: Any) -> Any:
         """Create the Lua `component` library table and bind it into `sandbox`."""
         self.sandbox = sandbox
@@ -254,6 +493,7 @@ class ComponentBus:
             comp = self.get_component(str(address))
             if comp is None:
                 raise RuntimeError(f"no such component: {address}")
+            self.consume_call_budget(comp.address, str(method), advance_tick_on_exhaustion=True)
             res = comp.invoke(str(method), *args)
             if isinstance(res, tuple):
                 return sandbox.python_to_lua([True, *[sandbox.python_to_lua(x) for x in res]])
@@ -337,7 +577,9 @@ class ComponentBus:
                 comp = self.get_component(str(address))
                 if comp is None:
                     return None
-                return sandbox.python_to_lua({m: True for m in comp.get_exposed_methods()})
+                return sandbox.python_to_lua(
+                    {m: self.get_method_info(comp.address, m)["direct"] for m in comp.get_exposed_methods()}
+                )
 
             def ctype(self_, address: str) -> Optional[str]:
                 comp = self.get_component(str(address))

@@ -6,12 +6,21 @@ from .components import (
     AECraftingJobState,
     ComponentBus,
     ComponentCallRecord,
+    ComputerComponent,
+    DataCardComponent,
     DatabaseSimulator,
+    DriveComponent,
     DriverAbstractMixin,
+    EEPROMComponent,
+    FilesystemComponent,
     GTMachineSimulator,
+    InternetComponent,
+    KeyboardComponent,
     MENetworkState,
+    ModemComponent,
     RedstoneSimulator,
     SchemaBackedComponent,
+    SoundCardComponent,
     StackSlotUserdata,
     TransposerInventorySimulator,
     WorldInventoryGrid,
@@ -19,11 +28,25 @@ from .components import (
 from .dag import DAGNode, ExecutionDAG, ExecutionTracer, TraceEvent
 from .environment import OCEnvironment
 from .lua_runner import LuaSpecRunner, LuaTestResult
-from .runtime import ALL_28_OPENOS_LIBS, DeterministicScheduler, OCLuaSandbox, VirtualFileSystem
-from .screen import GPUScreenEmulator
-from .specs import OCJarLoader, SchemaRegistry, get_default_registry
+from .runtime import (
+    ALL_28_OPENOS_LIBS,
+    DeadlockError,
+    DeterministicScheduler,
+    OCLuaSandbox,
+    OCMachineHost,
+    VirtualFileSystem,
+)
+from .screen import GPUScreenEmulator, OCPygameWindow
+from .specs import (
+    OCJarLoader,
+    OCMachineConfig,
+    SchemaRegistry,
+    get_default_registry,
+    load_oc_config,
+    validate_simulator_dumps,
+)
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 __all__ = [
     "AE2NetworkComponent",
@@ -32,27 +55,42 @@ __all__ = [
     "ALL_28_OPENOS_LIBS",
     "ComponentBus",
     "ComponentCallRecord",
+    "ComputerComponent",
     "DAGNode",
+    "DataCardComponent",
     "DatabaseSimulator",
+    "DeadlockError",
     "DeterministicScheduler",
+    "DriveComponent",
     "DriverAbstractMixin",
+    "EEPROMComponent",
     "ExecutionDAG",
     "ExecutionTracer",
+    "FilesystemComponent",
     "GPUScreenEmulator",
     "GTMachineSimulator",
+    "InternetComponent",
+    "KeyboardComponent",
     "LuaSpecRunner",
     "LuaTestResult",
     "MENetworkState",
+    "ModemComponent",
     "OCEnvironment",
     "OCJarLoader",
     "OCLuaSandbox",
+    "OCMachineConfig",
+    "OCMachineHost",
+    "OCPygameWindow",
     "RedstoneSimulator",
     "SchemaBackedComponent",
     "SchemaRegistry",
+    "SoundCardComponent",
     "StackSlotUserdata",
     "TraceEvent",
     "TransposerInventorySimulator",
     "VirtualFileSystem",
     "WorldInventoryGrid",
     "get_default_registry",
+    "load_oc_config",
+    "validate_simulator_dumps",
 ]

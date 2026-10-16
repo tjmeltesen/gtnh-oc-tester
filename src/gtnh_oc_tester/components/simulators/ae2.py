@@ -8,6 +8,35 @@ from typing import Any, Dict, List, Optional, Tuple
 from ..auto_mock import ComponentCallRecord, SchemaBackedComponent
 
 
+def _lua_to_py(value: Any, bus: Optional[Any] = None) -> Any:
+    """Recursively convert any Lupa Lua table (Lua 5.2/5.3/5.4) into Python lists or dicts."""
+    if value is None or isinstance(value, (bool, int, float, str, bytes)):
+        return value
+    if isinstance(value, (list, tuple)):
+        return [_lua_to_py(v, bus) for v in value]
+    if isinstance(value, dict):
+        return {_lua_to_py(k, bus): _lua_to_py(v, bus) for k, v in value.items()}
+    if hasattr(value, "items") and callable(getattr(value, "items", None)):
+        try:
+            items = list(value.items())
+            if not items:
+                return {}
+            keys = [k for k, _ in items if k != "n"]
+            if keys and all(isinstance(k, int) for k in keys):
+                sorted_keys = sorted(keys)
+                if sorted_keys == list(range(1, len(sorted_keys) + 1)):
+                    return [_lua_to_py(value[k], bus) for k in sorted_keys]
+            return {
+                _lua_to_py(k, bus): _lua_to_py(v, bus)
+                for k, v in items
+            }
+        except Exception:
+            pass
+    if bus and getattr(bus, "sandbox", None):
+        return bus.sandbox.lua_to_python(value)
+    return value
+
+
 @dataclass
 class AECraftingJobState:
     job_id: int
@@ -114,27 +143,31 @@ class AECraftableRecipe:
     def __oc_lua_proxy__(self, sandbox: Any) -> Any:
         factory = sandbox.lua.eval(
             """
-            function(py_craftable, stack_tbl)
+            function(py_craftable, stack_tbl, sb)
               local c = { type = "userdata" }
               function c.getItemStack() return stack_tbl end
               function c.request(amount, prioritizePower, cpuName)
-                return py_craftable.request_from_lua(amount or 1, prioritizePower, cpuName or "")
+                return py_craftable.request_from_lua(amount or 1, prioritizePower, cpuName or "", sb)
               end
               return c
             end
             """
         )
-        return factory(self, sandbox.python_to_lua(self.get_item_stack()))
+        return factory(self, sandbox.python_to_lua(self.get_item_stack()), sandbox)
 
     def request_from_lua(
         self,
         amount: int = 1,
         prioritize_power: Optional[bool] = True,
         cpu_name: str = "",
+        sandbox: Any = None,
     ) -> Any:
         job = self.request(amount, bool(prioritize_power), str(cpu_name or ""))
-        if self.network and self.network.bus and self.network.bus.sandbox:
-            return job.__oc_lua_proxy__(self.network.bus.sandbox)
+        target_sb = sandbox or (
+            self.network.bus.sandbox if (self.network and self.network.bus) else None
+        )
+        if target_sb is not None:
+            return job.__oc_lua_proxy__(target_sb)
         return job
 
 
@@ -484,18 +517,18 @@ class AE2NetworkComponent(SchemaBackedComponent):
         return _py_iter
 
     def _impl_getItemsInNetwork(self, filter_tbl: Optional[Any] = None) -> List[Dict[str, Any]]:
-        flt = self.bus.sandbox.lua_to_python(filter_tbl) if (filter_tbl is not None and self.bus and self.bus.sandbox) else filter_tbl
+        flt = _lua_to_py(filter_tbl, self.bus) if filter_tbl is not None else None
         if not isinstance(flt, dict):
             flt = None
         return [dict(item) for item in self.network.items if _match_filter(item, flt)]
 
     def _impl_getItemsInNetworkById(self, ids_tbl: Any) -> List[Dict[str, Any]]:
-        ids = self.bus.sandbox.lua_to_python(ids_tbl) if (self.bus and self.bus.sandbox) else ids_tbl
+        ids = _lua_to_py(ids_tbl, self.bus)
         id_set = set(ids.values() if isinstance(ids, dict) else (ids or []))
         return [dict(item) for item in self.network.items if item.get("id") in id_set]
 
     def _impl_getItemInNetwork(self, name_or_detail: Any, damage: Optional[int] = None, nbt: Optional[str] = None) -> Optional[Dict[str, Any]]:
-        arg = self.bus.sandbox.lua_to_python(name_or_detail) if (self.bus and self.bus.sandbox) else name_or_detail
+        arg = _lua_to_py(name_or_detail, self.bus)
         if isinstance(arg, dict):
             for item in self.network.items:
                 if _match_filter(item, arg):
@@ -513,7 +546,7 @@ class AE2NetworkComponent(SchemaBackedComponent):
     def _impl_getFluidInNetwork(self, name_or_detail: Optional[Any] = None) -> Any:
         if name_or_detail is None:
             return [dict(f) for f in self.network.fluids]
-        arg = self.bus.sandbox.lua_to_python(name_or_detail) if (self.bus and self.bus.sandbox) else name_or_detail
+        arg = _lua_to_py(name_or_detail, self.bus)
         if isinstance(arg, dict):
             return [dict(f) for f in self.network.fluids if _match_filter(f, arg)]
         matches = [dict(f) for f in self.network.fluids if f.get("name") == str(arg) or f.get("label") == str(arg)]
@@ -522,7 +555,7 @@ class AE2NetworkComponent(SchemaBackedComponent):
     def _impl_getEssentiaInNetwork(self, aspect_or_detail: Optional[Any] = None) -> List[Dict[str, Any]]:
         if aspect_or_detail is None:
             return [dict(e) for e in self.network.essentia]
-        arg = self.bus.sandbox.lua_to_python(aspect_or_detail) if (self.bus and self.bus.sandbox) else aspect_or_detail
+        arg = _lua_to_py(aspect_or_detail, self.bus)
         if isinstance(arg, dict):
             return [dict(e) for e in self.network.essentia if _match_filter(e, arg)]
         return [
@@ -544,13 +577,13 @@ class AE2NetworkComponent(SchemaBackedComponent):
         ]
 
     def _impl_getCraftables(self, filter_tbl: Optional[Any] = None) -> List[Any]:
-        flt = self.bus.sandbox.lua_to_python(filter_tbl) if (filter_tbl is not None and self.bus and self.bus.sandbox) else filter_tbl
+        flt = _lua_to_py(filter_tbl, self.bus) if filter_tbl is not None else None
         if not isinstance(flt, dict):
             flt = None
         return [c for c in self.network.craftables if _match_filter(c.output, flt)]
 
     def _impl_getCraftable(self, detail: Optional[Any] = None, recipe_type: Optional[str] = None) -> Optional[Any]:
-        flt = self.bus.sandbox.lua_to_python(detail) if (detail is not None and self.bus and self.bus.sandbox) else detail
+        flt = _lua_to_py(detail, self.bus) if detail is not None else None
         if isinstance(flt, str):
             flt = {"name": flt}
         elif not isinstance(flt, dict):
@@ -648,10 +681,10 @@ class AE2NetworkComponent(SchemaBackedComponent):
     def _impl_setFluidInterfaceConfiguration(self, arg1: int = 1, arg2: Optional[Any] = None, arg3: Optional[Any] = None) -> bool:
         if arg3 is not None or (isinstance(arg2, int) and arg3 is None):
             key = (int(arg1), int(arg2))
-            detail = self.bus.sandbox.lua_to_python(arg3) if (arg3 is not None and self.bus and self.bus.sandbox) else arg3
+            detail = _lua_to_py(arg3, self.bus) if arg3 is not None else None
         else:
             key = (None, int(arg1))
-            detail = self.bus.sandbox.lua_to_python(arg2) if (arg2 is not None and self.bus and self.bus.sandbox) else arg2
+            detail = _lua_to_py(arg2, self.bus) if arg2 is not None else None
         self.network.fluid_interface_configs[key] = dict(detail) if isinstance(detail, dict) else None
         return True
 
@@ -663,12 +696,12 @@ class AE2NetworkComponent(SchemaBackedComponent):
 
     def _impl_setInterfacePatternInput(self, slot: int, index: int, *args: Any) -> bool:
         pat = self._impl_getInterfacePattern(int(slot))
-        pat["inputs"][int(index)] = self.bus.sandbox.lua_to_python(args[0]) if (args and self.bus and self.bus.sandbox) else args
+        pat["inputs"][int(index)] = _lua_to_py(args[0], self.bus) if args else args
         return True
 
     def _impl_setInterfacePatternOutput(self, slot: int, index: int, *args: Any) -> bool:
         pat = self._impl_getInterfacePattern(int(slot))
-        pat["outputs"][int(index)] = self.bus.sandbox.lua_to_python(args[0]) if (args and self.bus and self.bus.sandbox) else args
+        pat["outputs"][int(index)] = _lua_to_py(args[0], self.bus) if args else args
         return True
 
     def _impl_clearInterfacePatternInput(self, slot: int, index: int) -> bool:
@@ -679,6 +712,28 @@ class AE2NetworkComponent(SchemaBackedComponent):
     def _impl_clearInterfacePatternOutput(self, slot: int, index: int) -> bool:
         pat = self._impl_getInterfacePattern(int(slot))
         pat["outputs"].pop(int(index), None)
+        return True
+
+    def _impl_storeInterfacePatternInput(
+        self, slot: int, index: int, db_address: str, entry: int
+    ) -> bool:
+        pat = self._impl_getInterfacePattern(int(slot))
+        val = pat["inputs"].get(int(index))
+        if self.bus and val is not None:
+            db = self.bus.get_component(db_address)
+            if db is not None and hasattr(db, "entries"):
+                db.entries[int(entry)] = dict(val) if isinstance(val, dict) else {"name": str(val), "size": 1}
+        return True
+
+    def _impl_storeInterfacePatternOutput(
+        self, slot: int, index: int, db_address: str, entry: int
+    ) -> bool:
+        pat = self._impl_getInterfacePattern(int(slot))
+        val = pat["outputs"].get(int(index))
+        if self.bus and val is not None:
+            db = self.bus.get_component(db_address)
+            if db is not None and hasattr(db, "entries"):
+                db.entries[int(entry)] = dict(val) if isinstance(val, dict) else {"name": str(val), "size": 1}
         return True
 
     # Level Maintainer methods

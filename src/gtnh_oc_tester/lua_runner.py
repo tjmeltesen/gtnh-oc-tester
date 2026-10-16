@@ -188,16 +188,33 @@ class LuaSpecRunner:
     def __init__(
         self,
         jar_path: Optional[str | Path] = None,
+        jar_version: str = "1.12.64-GTNH",
+        lua_version: str = "5.3",
+        cpu_tier: int = 3,
+        ram_tier: int = 6,
+        oc_config: Optional[Any] = None,
         dag_output_dir: Optional[str | Path] = None,
     ) -> None:
         self.jar_path = jar_path
+        self.jar_version = jar_version
+        self.lua_version = lua_version
+        self.cpu_tier = cpu_tier
+        self.ram_tier = ram_tier
+        self.oc_config = oc_config
         self.dag_output_dir = Path(dag_output_dir) if dag_output_dir else None
         self.harness_path = Path(__file__).resolve().parent / "lua_harness" / "test_harness.lua"
         self.current_env: Optional[OCEnvironment] = None
 
     def run_spec_file(self, spec_path: str | Path) -> List[LuaTestResult]:
         path = Path(spec_path)
-        env = OCEnvironment(jar_path=self.jar_path)
+        env = OCEnvironment(
+            jar_path=self.jar_path,
+            jar_version=self.jar_version,
+            lua_version=self.lua_version,
+            cpu_tier=self.cpu_tier,
+            ram_tier=self.ram_tier,
+            oc_config=self.oc_config,
+        )
         self.current_env = env
 
         harness_src = self.harness_path.read_text(encoding="utf-8")
@@ -205,7 +222,7 @@ class LuaSpecRunner:
 
         bridge = _MockOCBridge(self)
         env.sandbox.lua.globals()["mock_oc"] = bridge
-        env.sandbox.lua.globals()["package"]["loaded"]["mock_oc"] = bridge
+        env.sandbox.lua.eval('require("package").loaded')["mock_oc"] = bridge
 
         spec_src = path.read_text(encoding="utf-8")
         env.run_lua(spec_src, chunk_name=f"={path.name}")

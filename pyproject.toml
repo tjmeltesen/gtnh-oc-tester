@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gtnh-oc-tester"
+version = "0.1.0"
+description = "GTNH 2.9 OpenComputers Lua Testing, Simulation, GPU Screen Emulation, and Visual DAG Framework"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [
+    { name = "GTNH OC Tester Contributors" }
+]
+dependencies = [
+    "lupa>=2.0",
+    "pytest>=7.0",
+    "networkx>=3.0",
+    "graphviz>=0.20",
+    "pillow>=10.0",
+    "rich>=13.0",
+]
+
+[project.scripts]
+gtnh-oc-test = "gtnh_oc_tester.cli:main"
+
+[project.entry-points.pytest11]
+gtnh_oc_tester = "gtnh_oc_tester.pytest_plugin"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+gtnh_oc_tester = [
+    "specs/data/**/*",
+    "lua_harness/*.lua",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

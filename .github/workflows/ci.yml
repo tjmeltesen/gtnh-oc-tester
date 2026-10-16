@@ -1,0 +1,32 @@
+name: GTNH OpenComputers Lua Test Suite
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Graphviz and gtnh-oc-tester
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq graphviz
+          pip install -e .
+
+      - name: Run Python and Pure-Lua OpenComputers Test Suites
+        run: |
+          gtnh-oc-test --dag-dir ./oc-artifacts
+
+      - name: Upload Execution DAGs and Screen Snapshots
+        uses: actions/upload-artifact@v4
+        with:
+          name: oc-execution-dags-and-screens
+          path: ./oc-artifacts/

@@ -193,30 +193,33 @@ def test_wp5_cpu_tier_call_budgets() -> None:
     env_t1.attach_gt_machine("gt_machine", address="gt-budget-1")
     env_t3.attach_gt_machine("gt_machine", address="gt-budget-3")
 
-    t1_ticks = env_t1.run_lua(
+    t1_uptime = env_t1.run_lua(
         r"""
         local component = require("component")
+        local computer = require("computer")
         local gt = component.proxy(component.get("gt-budget-1"))
-        local t0 = os.clock()
+        local t0 = computer.uptime()
         for i = 1, 30 do
           gt.getEUStored()
         end
-        return os.clock() - t0
+        return computer.uptime() - t0
         """
     )
-    t3_ticks = env_t3.run_lua(
+    t3_uptime = env_t3.run_lua(
         r"""
         local component = require("component")
+        local computer = require("computer")
         local gt = component.proxy(component.get("gt-budget-3"))
-        local t0 = os.clock()
+        local t0 = computer.uptime()
         for i = 1, 30 do
           gt.getEUStored()
         end
-        return os.clock() - t0
+        return computer.uptime() - t0
         """
     )
     # Tier 1 (budget 0.5 => 5 calls/tick) takes ~3x more ticks than Tier 3 (budget 1.5 => 15 calls/tick)
-    assert t1_ticks > t3_ticks
+    assert t1_uptime > t3_uptime
+    assert env_t1.scheduler.current_tick > env_t3.scheduler.current_tick
     assert env_t1.bus.budget_exhaustions > env_t3.bus.budget_exhaustions
 
 

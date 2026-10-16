@@ -754,6 +754,10 @@ class OCMachineHost:
                 "dump = nil,",
             )
             .replace(
+                "clock = os.clock,",
+                "clock = function() return computer.uptime() end,",
+            )
+            .replace(
                 "local function checkDeadline()\n  if computer.realTime() > deadline then",
                 """local _trace_ignored = {
   checkArg = true, pairs = true, ipairs = true, next = true,

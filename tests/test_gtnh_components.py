@@ -200,3 +200,66 @@ def test_redstone_vanilla_bundled_and_wireless(oc_env: OCEnvironment) -> None:
         """
     )
     assert res == ("redstone_changed", 2, 12, 15, 255, 42, True)
+
+
+def test_auto_mock_fluid_interface_me_interface_and_gt_machine_declarations(oc_env: OCEnvironment) -> None:
+    """Verify that fluid_interface, me_interface, and gt_machine declarations are automatically mocked without manual attach calls."""
+    res = oc_env.run_lua(
+        """
+        local component = require("component")
+
+        -- 1. Explicit UUID declarations in script config table
+        local CONFIG = {
+            fluidInterfaceAddress = "f1000000-0000-4000-8000-000000000001",
+            interfaceAddress = "b4b53e68-8262-40a4-9aaf-b1c9d9ca55a2",
+            machineAddress = "e8b9066a-e6ff-4dae-b033-275fa283e38e",
+            databaseAddress = "aebdc662-9cb1-4611-b360-0fcdd33d8aba",
+        }
+
+        -- Declared addresses are immediately present in component.list()
+        local listed_types = {}
+        for addr, ctype in component.list() do
+            listed_types[addr] = ctype
+        end
+        assert(listed_types[CONFIG.fluidInterfaceAddress] == "fluid_interface")
+        assert(listed_types[CONFIG.interfaceAddress] == "me_interface")
+        assert(listed_types[CONFIG.machineAddress] == "gt_machine")
+        assert(listed_types[CONFIG.databaseAddress] == "database")
+
+        -- 2. Primary access & filtered component.list(ctype) auto-mocks on demand
+        local fi = component.fluid_interface
+        local mi = component.me_interface
+        local gt = component.gt_machine
+
+        local fluids = fi.getFluidsInNetwork()
+        local items = mi.getItemsInNetwork()
+        assert(type(fluids) == "table" and #fluids >= 1)
+        assert(type(items) == "table" and #items >= 1)
+
+        -- 3. Store item and fluid drop in database and configure both item and fluid interface slots
+        local stored_item = mi.store({ name = items[1].name, damage = 0 }, CONFIG.databaseAddress, 1, 64)
+        local stored_fluid = fi.store({ label = "drop of " .. fluids[1].label }, CONFIG.databaseAddress, 2)
+        assert(stored_item == true)
+        assert(stored_fluid == true)
+
+        assert(mi.setInterfaceConfiguration(1, CONFIG.databaseAddress, 1, 64) == true)
+        assert(fi.setFluidInterfaceConfiguration(1, CONFIG.databaseAddress, 2) == true)
+        assert(mi.getInterfaceConfiguration(1).name == items[1].name)
+        assert(fi.getFluidInterfaceConfiguration(1).name == fluids[1].name)
+
+        -- 4. Call GT machine methods on the declared machineAddress without prior attach
+        local sensor = component.invoke(CONFIG.machineAddress, "getSensorInformation")
+        assert(type(sensor) == "table" and #sensor >= 1)
+        assert(component.invoke(CONFIG.machineAddress, "isWorkAllowed") == true)
+
+        return listed_types[CONFIG.fluidInterfaceAddress], listed_types[CONFIG.interfaceAddress], listed_types[CONFIG.machineAddress], items[1].name, fluids[1].name
+        """
+    )
+    assert res == (
+        "fluid_interface",
+        "me_interface",
+        "gt_machine",
+        "minecraft:iron_ingot",
+        "water",
+    )
+

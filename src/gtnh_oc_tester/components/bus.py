@@ -163,6 +163,7 @@ class ComponentBus:
         self.current_tick_budget_used: float = 0.0
         self.enforce_call_budget: bool = bool(enforce_call_budget)
         self.budget_exhaustions: int = 0
+        self.auto_mock_missing: bool = True
 
         self.components: Dict[str, SchemaBackedComponent] = {}
         self.primaries: Dict[str, str] = {}
@@ -174,6 +175,161 @@ class ComponentBus:
 
         if self.scheduler is not None:
             self.scheduler.add_tick_hook(self._on_tick)
+
+    def _infer_auto_mock_type(
+        self,
+        address_or_hint: str,
+        component_type: Optional[str] = None,
+        method_name: Optional[str] = None,
+    ) -> str:
+        """Infer the best GTNH 2.9 component type for an unattached component address or declaration."""
+        if component_type:
+            return str(component_type)
+        s = str(address_or_hint).strip().lower()
+        all_types = set(self.registry.list_component_types())
+        if s in all_types:
+            return s
+        for candidate in (
+            "fluid_interface",
+            "me_interface",
+            "me_controller",
+            "gt_machine",
+            "gt_batterybuffer",
+            "gt_energycontainer",
+            "transposer",
+            "inventory_controller",
+            "tank_controller",
+            "database",
+            "redstone",
+            "level_maintainer",
+            "upgrade_me",
+        ):
+            if candidate in s or candidate.replace("_", "-") in s:
+                return candidate
+        if "controller" in s or "ctrl" in s or "network" in s:
+            return "me_controller"
+        if "fluid" in s:
+            return "fluid_interface"
+        if "interface" in s or "iface" in s:
+            return "me_interface"
+        if "machine" in s or "lsc" in s or "ebf" in s or "lcr" in s or "lathe" in s or "macerator" in s or "bender" in s:
+            return "gt_machine"
+        if "transpos" in s or "tr_" in s or "tr-" in s:
+            return "transposer"
+        if "db" in s or "data" in s:
+            return "database"
+        if "rs" in s or "red" in s:
+            return "redstone"
+        if method_name:
+            m = str(method_name)
+            for candidate in (
+                "fluid_interface",
+                "me_interface",
+                "gt_machine",
+                "me_controller",
+                "transposer",
+                "database",
+                "redstone",
+            ):
+                schema = self.registry.get_component_schema(candidate, host=self.host)
+                if schema and m in schema.get_method_names():
+                    return candidate
+            for ctype in sorted(all_types):
+                schema = self.registry.get_component_schema(ctype, host=self.host)
+                if schema and m in schema.get_method_names():
+                    return ctype
+        return "fluid_interface"
+
+    def ensure_auto_mock(
+        self,
+        address: str,
+        component_type: Optional[str] = None,
+        method_name: Optional[str] = None,
+    ) -> SchemaBackedComponent:
+        """Return an existing component at `address` or dynamically instantiate a mock for it."""
+        existing = self.get_component(address, component_type=component_type, auto_create=False)
+        if existing is not None:
+            return existing
+        ctype = self._infer_auto_mock_type(address, component_type=component_type, method_name=method_name)
+        had_sig = bool(self.scheduler and self.scheduler.signal_queue)
+        comp = self.attach(ctype, address=str(address))
+        setattr(comp, "_is_auto_mock", True)
+        # Avoid polluting the test signal queue with synthetic component_added events on lazy lookup
+        if (
+            self.scheduler is not None
+            and not had_sig
+            and self.scheduler.signal_queue
+            and self.scheduler.signal_queue[-1][0] == "component_added"
+        ):
+            self.scheduler.signal_queue.pop()
+        if ctype in ("fluid_interface", "me_interface", "me_controller"):
+            for extra_type in ("fluid_interface", "me_interface", "me_controller"):
+                schema = self.registry.get_component_schema(extra_type, host=self.host)
+                if schema:
+                    comp.schema.methods.update(schema.methods)
+                    comp.schema.dump_methods.update(schema.dump_methods)
+                    comp.schema.dump_fields.update(schema.dump_fields)
+            for gt_type in ("gt_machine", "transposer", "database", "redstone"):
+                schema = self.registry.get_component_schema(gt_type, host=self.host)
+                if schema:
+                    for mname, mspec in schema.methods.items():
+                        comp.schema.methods.setdefault(mname, mspec)
+                    for mname, dspec in schema.dump_methods.items():
+                        comp.schema.dump_methods.setdefault(mname, dspec)
+        return comp
+
+    def scan_and_register_lua_declarations(self, lua_code: str) -> List[SchemaBackedComponent]:
+        """Scan Lua source code for component declarations (`fluid_interface`, `me_interface`, `gt_machine`, etc.) and pre-generate mocks."""
+        if not self.auto_mock_missing or not lua_code:
+            return []
+        created: List[SchemaBackedComponent] = []
+        # 1. Explicit UUIDs paired with variable/field names (e.g. `interfaceAddress = "b4b53e68-..."`, `local ME_CONTROLLER_ADDR = "61df706b-..."`)
+        decl_pattern = re.compile(
+            r'([A-Za-z0-9_]+)\s*=\s*["\']([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})["\']'
+        )
+        for var_name, uuid_addr in decl_pattern.findall(lua_code):
+            if uuid_addr in self.components:
+                continue
+            ctype = self._infer_auto_mock_type(var_name)
+            created.append(self.ensure_auto_mock(uuid_addr, component_type=ctype))
+
+        # 2. Wrapper constructors or component.proxy/invoke calls with literal addresses
+        # e.g. `Interface:new("my-iface")`, `Machine:new("my-gt")`, `FluidInterface:new("...")`, `component.proxy("addr", "fluid_interface")`
+        wrapper_map = {
+            "FluidInterface": "fluid_interface",
+            "FluidInterfaceComponent": "fluid_interface",
+            "Interface": "me_interface",
+            "InterfaceComponent": "me_interface",
+            "MeInterface": "me_interface",
+            "MeInterfaceComponent": "me_interface",
+            "MeController": "me_controller",
+            "MeControllerComponent": "me_controller",
+            "Machine": "gt_machine",
+            "MachineComponent": "gt_machine",
+            "GtMachine": "gt_machine",
+            "Transposer": "transposer",
+            "TransposerComponent": "transposer",
+            "Database": "database",
+            "DatabaseComponent": "database",
+            "Redstone": "redstone",
+            "RedstoneComponent": "redstone",
+        }
+        wrapper_pattern = re.compile(
+            r'\b(' + "|".join(wrapper_map.keys()) + r')\s*[:\.]\s*new\s*\(\s*["\']([^"\']+)["\']'
+        )
+        for cls_name, addr in wrapper_pattern.findall(lua_code):
+            if addr and addr not in self.components and not addr.startswith("REPLACE_"):
+                created.append(self.ensure_auto_mock(addr, component_type=wrapper_map[cls_name]))
+
+        # 3. `getComponent(addr, "ClassName")` calls with literal address
+        cache_pattern = re.compile(
+            r'getComponent\s*\(\s*["\']([^"\']+)["\']\s*,\s*["\'](' + "|".join(wrapper_map.keys()) + r')["\']'
+        )
+        for addr, cls_name in cache_pattern.findall(lua_code):
+            if addr and addr not in self.components and not addr.startswith("REPLACE_"):
+                created.append(self.ensure_auto_mock(addr, component_type=wrapper_map[cls_name]))
+
+        return created
 
     def _on_tick(self, current_tick: int) -> None:
         self.current_tick_budget_used = 0.0
@@ -428,7 +584,12 @@ class ComponentBus:
             self.scheduler.push_signal("component_removed", address, ctype)
         return True
 
-    def get_component(self, address_or_prefix: str, component_type: Optional[str] = None) -> Optional[SchemaBackedComponent]:
+    def get_component(
+        self,
+        address_or_prefix: str,
+        component_type: Optional[str] = None,
+        auto_create: bool = False,
+    ) -> Optional[SchemaBackedComponent]:
         if address_or_prefix in self.components:
             comp = self.components[address_or_prefix]
             if component_type is None or comp.component_type == component_type:
@@ -437,15 +598,30 @@ class ComponentBus:
             if addr.startswith(str(address_or_prefix)):
                 if component_type is None or comp.component_type == component_type:
                     return comp
+        if auto_create and self.auto_mock_missing and address_or_prefix:
+            return self.ensure_auto_mock(str(address_or_prefix), component_type=component_type)
         return None
 
-    def get_primary_component(self, component_type: str) -> Optional[SchemaBackedComponent]:
+    def get_primary_component(self, component_type: str, auto_create: bool = True) -> Optional[SchemaBackedComponent]:
         addr = self.primaries.get(component_type)
         if addr and addr in self.components:
             return self.components[addr]
         for comp in self.components.values():
             if comp.component_type == component_type:
                 self.primaries[component_type] = comp.address
+                return comp
+        if auto_create and self.auto_mock_missing and component_type:
+            if component_type in set(self.registry.list_component_types()):
+                had_sig = bool(self.scheduler and self.scheduler.signal_queue)
+                comp = self.attach(component_type, primary=True)
+                setattr(comp, "_is_auto_mock", True)
+                if (
+                    self.scheduler is not None
+                    and not had_sig
+                    and self.scheduler.signal_queue
+                    and self.scheduler.signal_queue[-1][0] == "component_added"
+                ):
+                    self.scheduler.signal_queue.pop()
                 return comp
         return None
 
@@ -461,6 +637,20 @@ class ComponentBus:
             else:
                 if filter_str in c.component_type:
                     out[addr] = c.component_type
+        if not out and self.auto_mock_missing:
+            f_str = str(filter_str)
+            all_types = set(self.registry.list_component_types())
+            if f_str in all_types:
+                comp = self.get_primary_component(f_str, auto_create=True)
+                if comp is not None:
+                    out[comp.address] = comp.component_type
+            elif not is_exact:
+                for ctype in sorted(all_types):
+                    if f_str in ctype:
+                        comp = self.get_primary_component(ctype, auto_create=True)
+                        if comp is not None:
+                            out[comp.address] = comp.component_type
+                        break
         return out
 
     def validate_simulator_dumps(
@@ -489,6 +679,8 @@ class ComponentBus:
 
         def _invoke_packed(address: str, method: str, *args: Any) -> Any:
             comp = self.get_component(str(address))
+            if comp is None and self.auto_mock_missing:
+                comp = self.ensure_auto_mock(str(address), method_name=str(method))
             if comp is None:
                 raise RuntimeError(f"no such component: {address}")
             self.consume_call_budget(comp.address, str(method), advance_tick_on_exhaustion=True)
@@ -498,7 +690,7 @@ class ComponentBus:
             return sandbox.python_to_lua([True, sandbox.python_to_lua(res)])
 
         def _make_proxy(address: str) -> Any:
-            comp = self.get_component(str(address))
+            comp = self.get_component(str(address), auto_create=self.auto_mock_missing)
             if comp is None:
                 return None
             if comp.address in proxy_cache:
@@ -568,13 +760,13 @@ class ComponentBus:
                 return _invoke_packed(str(address), str(method), *args)
 
             def doc(self_, address: str, method: str) -> Optional[str]:
-                comp = self.get_component(str(address))
+                comp = self.get_component(str(address), auto_create=self.auto_mock_missing)
                 if comp is None:
                     return None
                 return comp.get_doc(str(method))
 
             def methods(self_, address: str) -> Any:
-                comp = self.get_component(str(address))
+                comp = self.get_component(str(address), auto_create=self.auto_mock_missing)
                 if comp is None:
                     return None
                 return sandbox.python_to_lua(
@@ -582,15 +774,19 @@ class ComponentBus:
                 )
 
             def ctype(self_, address: str) -> Optional[str]:
-                comp = self.get_component(str(address))
+                comp = self.get_component(str(address), auto_create=self.auto_mock_missing)
                 return comp.component_type if comp else None
 
             def slot(self_, address: str) -> Optional[int]:
-                comp = self.get_component(str(address))
+                comp = self.get_component(str(address), auto_create=self.auto_mock_missing)
                 return comp.slot if comp else None
 
             def get_addr(self_, prefix: str, ctype: Optional[str] = None) -> Optional[str]:
-                comp = self.get_component(str(prefix), str(ctype) if ctype else None)
+                comp = self.get_component(
+                    str(prefix),
+                    str(ctype) if ctype else None,
+                    auto_create=self.auto_mock_missing,
+                )
                 return comp.address if comp else None
 
             def is_available(self_, ctype: str) -> bool:

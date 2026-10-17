@@ -326,6 +326,34 @@ class MENetworkState:
         self.interface_configs: Dict[int, Optional[Dict[str, Any]]] = {}
         self.fluid_interface_configs: Dict[Tuple[Optional[int], int], Optional[Dict[str, Any]]] = {}
         self.patterns: Dict[int, Dict[str, Any]] = {}
+        self._explicitly_modified: bool = False
+
+    def ensure_auto_mock_defaults(self) -> None:
+        """Seed default items and fluids for auto-mocked AE2 components when no state was manually added."""
+        if self._explicitly_modified or self.items or self.fluids:
+            return
+        self.items.append(
+            {
+                "name": "minecraft:iron_ingot",
+                "label": "Iron Ingot",
+                "size": 64,
+                "maxSize": 64,
+                "damage": 0,
+                "maxDamage": 0,
+                "hasTag": False,
+                "isCraftable": False,
+                "id": 1,
+            }
+        )
+        self.fluids.append(
+            {
+                "name": "water",
+                "label": "Water",
+                "amount": 4000,
+                "hasTag": False,
+                "isCraftable": False,
+            }
+        )
 
     def add_item(
         self,
@@ -338,6 +366,7 @@ class MENetworkState:
         nbt: Optional[str] = None,
         item_id: int = 1,
     ) -> Dict[str, Any]:
+        self._explicitly_modified = True
         for existing in self.items:
             if existing.get("name") == name and existing.get("damage", 0) == damage:
                 old_size = existing["size"]
@@ -379,6 +408,7 @@ class MENetworkState:
         label: Optional[str] = None,
         is_craftable: bool = False,
     ) -> Dict[str, Any]:
+        self._explicitly_modified = True
         for existing in self.fluids:
             if existing.get("name") == name:
                 old_amt = existing["amount"]
@@ -615,6 +645,8 @@ class AE2NetworkComponent(SchemaBackedComponent):
 
     # CommonNetworkAPI
     def _impl_allItems(self) -> Any:
+        if getattr(self, "_is_auto_mock", False):
+            self.network.ensure_auto_mock_defaults()
         items_snapshot = [dict(i) for i in self.network.items]
         if self.bus and self.bus.sandbox:
             sb = self.bus.sandbox
@@ -636,17 +668,23 @@ class AE2NetworkComponent(SchemaBackedComponent):
         return _py_iter
 
     def _impl_getItemsInNetwork(self, filter_tbl: Optional[Any] = None) -> List[Dict[str, Any]]:
+        if getattr(self, "_is_auto_mock", False):
+            self.network.ensure_auto_mock_defaults()
         flt = _lua_to_py(filter_tbl, self.bus) if filter_tbl is not None else None
         if not isinstance(flt, dict):
             flt = None
         return [dict(item) for item in self.network.items if _match_filter(item, flt)]
 
     def _impl_getItemsInNetworkById(self, ids_tbl: Any) -> List[Dict[str, Any]]:
+        if getattr(self, "_is_auto_mock", False):
+            self.network.ensure_auto_mock_defaults()
         ids = _lua_to_py(ids_tbl, self.bus)
         id_set = set(ids.values() if isinstance(ids, dict) else (ids or []))
         return [dict(item) for item in self.network.items if item.get("id") in id_set]
 
     def _impl_getItemInNetwork(self, name_or_detail: Any, damage: Optional[int] = None, nbt: Optional[str] = None) -> Optional[Dict[str, Any]]:
+        if getattr(self, "_is_auto_mock", False):
+            self.network.ensure_auto_mock_defaults()
         arg = _lua_to_py(name_or_detail, self.bus)
         if isinstance(arg, dict):
             for item in self.network.items:
@@ -660,9 +698,13 @@ class AE2NetworkComponent(SchemaBackedComponent):
         return None
 
     def _impl_getFluidsInNetwork(self) -> List[Dict[str, Any]]:
+        if getattr(self, "_is_auto_mock", False):
+            self.network.ensure_auto_mock_defaults()
         return [dict(f) for f in self.network.fluids]
 
     def _impl_getFluidInNetwork(self, name_or_detail: Optional[Any] = None) -> Any:
+        if getattr(self, "_is_auto_mock", False):
+            self.network.ensure_auto_mock_defaults()
         if name_or_detail is None:
             return [dict(f) for f in self.network.fluids]
         arg = _lua_to_py(name_or_detail, self.bus)
@@ -759,20 +801,74 @@ class AE2NetworkComponent(SchemaBackedComponent):
         start_slot: int = 1,
         count: Optional[int] = None,
     ) -> bool:
+        if getattr(self, "_is_auto_mock", False):
+            self.network.ensure_auto_mock_defaults()
+        flt = _lua_to_py(filter_tbl, self.bus) if filter_tbl is not None else None
         items = self._impl_getItemsInNetwork(filter_tbl)
+        # Support AE2FC fluid drops stored via `{ label = "drop of <Fluid>" }` or `{ name = "ae2fc:fluid_drop" }`
+        if not items and isinstance(flt, dict):
+            lbl = str(flt.get("label") or "")
+            if lbl.lower().startswith("drop of ") or flt.get("name") == "ae2fc:fluid_drop":
+                fluid_target = lbl[8:].strip() if lbl.lower().startswith("drop of ") else str(flt.get("fluid") or "water")
+                matched_fluid: Optional[Dict[str, Any]] = None
+                for f in self.network.fluids:
+                    if (
+                        str(f.get("label", "")).lower() == fluid_target.lower()
+                        or str(f.get("name", "")).lower() == fluid_target.lower()
+                    ):
+                        matched_fluid = f
+                        break
+                if matched_fluid is None and getattr(self, "_is_auto_mock", False):
+                    matched_fluid = {
+                        "name": fluid_target.lower().replace(" ", "_"),
+                        "label": fluid_target,
+                        "amount": 1000,
+                    }
+                if matched_fluid is not None:
+                    items = [
+                        {
+                            "name": "ae2fc:fluid_drop",
+                            "label": f"drop of {matched_fluid.get('label', fluid_target)}",
+                            "size": 1,
+                            "maxSize": 64,
+                            "damage": 0,
+                            "hasTag": True,
+                            "fluidDrop": {
+                                "name": matched_fluid.get("name", fluid_target.lower()),
+                                "label": matched_fluid.get("label", fluid_target),
+                                "amount": int(matched_fluid.get("amount", 1000)),
+                            },
+                        }
+                    ]
+            elif getattr(self, "_is_auto_mock", False) and (flt.get("name") or flt.get("label")):
+                name_val = str(flt.get("name") or flt.get("label"))
+                items = [
+                    {
+                        "name": name_val,
+                        "label": str(flt.get("label") or name_val.split(":")[-1].replace("_", " ").title()),
+                        "size": int(count or flt.get("size") or 1),
+                        "maxSize": 64,
+                        "damage": int(flt.get("damage") or 0),
+                        "hasTag": False,
+                    }
+                ]
         if self.bus:
-            db = self.bus.get_component(db_address)
+            db = self.bus.get_component(
+                str(db_address),
+                component_type="database",
+                auto_create=self.bus.auto_mock_missing,
+            )
             if db is not None and hasattr(db, "entries"):
                 slot = int(start_slot or 1)
                 limit = int(count) if count is not None else len(items)
-                for item in items[:limit]:
+                for item in items[: max(1, limit)]:
                     db.entries[slot] = dict(item)
                     slot += 1
         return True
 
     # MEInterfaceAPI & FluidInterface & PatternEditor
     def _impl_getInterfaceConfiguration(self, slot: int = 1) -> Optional[Dict[str, Any]]:
-        return self.network.interface_configs.get(int(slot or 1))
+        return self.network.interface_configs.get(int(slot if slot is not None else 1))
 
     def _impl_setInterfaceConfiguration(self, *args: Any) -> bool:
         if not args:
@@ -791,7 +887,11 @@ class AE2NetworkComponent(SchemaBackedComponent):
             size = int(args[3]) if len(args) > 3 and args[3] is not None else 1
         entry = {"name": "minecraft:stone", "size": size, "database": db_addr, "entry": db_idx}
         if self.bus:
-            db = self.bus.get_component(db_addr)
+            db = self.bus.get_component(
+                db_addr,
+                component_type="database",
+                auto_create=self.bus.auto_mock_missing,
+            )
             if db is not None and hasattr(db, "entries") and db_idx in db.entries:
                 entry = dict(db.entries[db_idx])
                 entry["size"] = size
@@ -799,16 +899,77 @@ class AE2NetworkComponent(SchemaBackedComponent):
         return True
 
     def _impl_getFluidInterfaceConfiguration(self, arg1: int = 1, arg2: Optional[int] = None) -> Optional[Dict[str, Any]]:
-        key = (None, int(arg1)) if arg2 is None else (int(arg1), int(arg2))
-        return self.network.fluid_interface_configs.get(key)
+        if arg2 is None:
+            return (
+                self.network.fluid_interface_configs.get((None, int(arg1)))
+                or self.network.fluid_interface_configs.get((int(arg1), 1))
+            )
+        return self.network.fluid_interface_configs.get((int(arg1), int(arg2)))
 
-    def _impl_setFluidInterfaceConfiguration(self, arg1: int = 1, arg2: Optional[Any] = None, arg3: Optional[Any] = None) -> bool:
-        if arg3 is not None or (isinstance(arg2, int) and arg3 is None):
+    def _impl_setFluidInterfaceConfiguration(
+        self,
+        arg1: Optional[Any] = None,
+        arg2: Optional[Any] = None,
+        arg3: Optional[Any] = None,
+    ) -> bool:
+        if arg1 is None:
+            self.network.fluid_interface_configs[(None, 1)] = None
+            return True
+        # Overload 1: setFluidInterfaceConfiguration(side: int) -> clear fluid config on side/slot
+        if isinstance(arg1, (int, float)) and arg2 is None and arg3 is None:
+            s = int(arg1)
+            self.network.fluid_interface_configs[(None, s)] = None
+            self.network.fluid_interface_configs[(s, 1)] = None
+            return True
+        # Overload 2: setFluidInterfaceConfiguration(side: int, db_address: str, db_entry: int)
+        if isinstance(arg1, (int, float)) and isinstance(arg2, str):
+            side = int(arg1)
+            db_addr = str(arg2)
+            db_idx = int(arg3) if arg3 is not None else 1
+            entry: Dict[str, Any] = {"name": "water", "label": "Water", "amount": 1000, "database": db_addr, "entry": db_idx}
+            if self.bus:
+                db = self.bus.get_component(
+                    db_addr,
+                    component_type="database",
+                    auto_create=self.bus.auto_mock_missing,
+                )
+                if db is not None and hasattr(db, "entries") and db_idx in db.entries:
+                    db_item = db.entries[db_idx]
+                    if isinstance(db_item.get("fluidDrop"), dict):
+                        entry = dict(db_item["fluidDrop"])
+                    else:
+                        entry = dict(db_item)
+            self.network.fluid_interface_configs[(None, side)] = entry
+            self.network.fluid_interface_configs[(side, 1)] = entry
+            return True
+        # Overload 3: setFluidInterfaceConfiguration(db_address: str, db_entry: int)
+        if isinstance(arg1, str):
+            db_addr = str(arg1)
+            db_idx = int(arg2) if arg2 is not None else 1
+            entry = {"name": "water", "label": "Water", "amount": 1000, "database": db_addr, "entry": db_idx}
+            if self.bus:
+                db = self.bus.get_component(
+                    db_addr,
+                    component_type="database",
+                    auto_create=self.bus.auto_mock_missing,
+                )
+                if db is not None and hasattr(db, "entries") and db_idx in db.entries:
+                    db_item = db.entries[db_idx]
+                    if isinstance(db_item.get("fluidDrop"), dict):
+                        entry = dict(db_item["fluidDrop"])
+                    else:
+                        entry = dict(db_item)
+            self.network.fluid_interface_configs[(None, 1)] = entry
+            return True
+        # Overload 4: setFluidInterfaceConfiguration(side: int, slot: int, detail_tbl: dict | None)
+        if isinstance(arg1, (int, float)) and isinstance(arg2, (int, float)):
             key = (int(arg1), int(arg2))
             detail = _lua_to_py(arg3, self.bus) if arg3 is not None else None
-        else:
-            key = (None, int(arg1))
-            detail = _lua_to_py(arg2, self.bus) if arg2 is not None else None
+            self.network.fluid_interface_configs[key] = dict(detail) if isinstance(detail, dict) else None
+            return True
+        # Overload 5: setFluidInterfaceConfiguration(slot: int, detail_tbl: dict)
+        key = (None, int(arg1))
+        detail = _lua_to_py(arg2, self.bus) if arg2 is not None else None
         self.network.fluid_interface_configs[key] = dict(detail) if isinstance(detail, dict) else None
         return True
 

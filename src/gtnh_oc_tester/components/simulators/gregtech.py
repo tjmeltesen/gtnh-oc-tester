@@ -71,6 +71,8 @@ class GTMachineSimulator(SchemaBackedComponent):
         self.work_progress = int(work_progress)
         self.work_max_progress = int(work_max_progress)
         self.circuit_config = -1
+        self._auto_mock_last_poll_tick: Optional[int] = None
+        self._auto_mock_stage: int = 0
 
         self._custom_sensor_information: Optional[List[str]] = None
         self.parameters: Dict[Any, float] = {i: 0.0 for i in range(20)}
@@ -205,6 +207,29 @@ class GTMachineSimulator(SchemaBackedComponent):
         return True
 
     def _impl_getSensorInformation(self) -> List[str]:
+        if getattr(self, "_is_auto_mock", False) and self._custom_sensor_information is None:
+            cur_tick = (
+                self.bus.scheduler.current_tick
+                if (self.bus is not None and self.bus.scheduler is not None)
+                else 0
+            )
+            if self._auto_mock_last_poll_tick is None:
+                self._auto_mock_last_poll_tick = cur_tick
+                self._auto_mock_stage = 0
+                self.work_progress = 0
+                self.has_work = False
+            elif cur_tick > self._auto_mock_last_poll_tick:
+                self._auto_mock_last_poll_tick = cur_tick
+                self._auto_mock_stage = (self._auto_mock_stage + 1) % 3
+                if self._auto_mock_stage == 1:
+                    self.has_work = True
+                    self.work_progress = max(20, self.work_max_progress // 2)
+                elif self._auto_mock_stage == 2:
+                    self.has_work = False
+                    self.work_progress = self.work_max_progress
+                else:
+                    self.has_work = False
+                    self.work_progress = 0
         return list(self.sensor_information)
 
     def _impl_getSteamMaxStored(self) -> int:

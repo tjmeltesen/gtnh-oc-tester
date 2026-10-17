@@ -331,15 +331,30 @@ class OCMachineHost:
             else:
                 if str(filter_str) in ctype:
                     out[addr] = ctype
+        if not out and self._booted and self.sandbox.component_bus is not None:
+            out.update(self.sandbox.component_bus.list_matching(str(filter_str), is_exact))
         return out
 
     def _get_component_type(self, address: str) -> Optional[str]:
         all_c = self._list_all_components()
-        return all_c.get(str(address))
+        addr = str(address)
+        if addr in all_c:
+            return all_c[addr]
+        if self._booted and self.sandbox.component_bus is not None:
+            comp = self.sandbox.component_bus.get_component(
+                addr,
+                auto_create=self.sandbox.component_bus.auto_mock_missing,
+            )
+            if comp is not None:
+                return comp.component_type
+        return None
 
     def _get_component_slot(self, address: str) -> int:
         if self.sandbox.component_bus is not None:
-            comp = self.sandbox.component_bus.get_component(str(address))
+            comp = self.sandbox.component_bus.get_component(
+                str(address),
+                auto_create=bool(self._booted and self.sandbox.component_bus.auto_mock_missing),
+            )
             if comp is not None:
                 return comp.slot
         if str(address) == self.vfs.root_address:
@@ -362,6 +377,16 @@ class OCMachineHost:
         if m == "open":
             path = str(args[0]) if args else "/"
             mode = str(args[1]) if len(args) > 1 and args[1] is not None else "r"
+            if (
+                self._booted
+                and self.sandbox.component_bus is not None
+                and self.sandbox.component_bus.auto_mock_missing
+                and path.endswith(".lua")
+                and vfs_obj.exists(path)
+            ):
+                content = vfs_obj.read_file(path)
+                if content:
+                    self.sandbox.component_bus.scan_and_register_lua_declarations(content)
             hid, err = vfs_obj.open_handle(path, mode)
             if hid is None:
                 return (None, err or str(path))
@@ -493,7 +518,10 @@ class OCMachineHost:
             return tbl
 
         if self.sandbox.component_bus is not None:
-            comp = self.sandbox.component_bus.get_component(addr)
+            comp = self.sandbox.component_bus.get_component(
+                addr,
+                auto_create=bool(self._booted and self.sandbox.component_bus.auto_mock_missing),
+            )
             if comp is not None:
                 tbl = self.lua.table()
                 for m in sorted(comp.get_exposed_methods()):
@@ -616,6 +644,8 @@ class OCMachineHost:
             # Check ComponentBus if attached (for non-generic or custom-overridden components)
             if self.sandbox.component_bus is not None:
                 comp = self.sandbox.component_bus.get_component(addr)
+                if comp is None and self._booted and self.sandbox.component_bus.auto_mock_missing:
+                    comp = self.sandbox.component_bus.ensure_auto_mock(addr, method_name=m)
                 if comp is not None:
                     # Handle built-in eeprom or computer if they are generic SchemaBackedComponent without custom overrides
                     if comp.component_type == "eeprom" and m not in comp.mock_overrides and not hasattr(comp, f"_impl_{m}"):
@@ -661,7 +691,10 @@ class OCMachineHost:
 
     def _host_component_doc(self, address: str, method: str) -> Optional[str]:
         if self.sandbox.component_bus is not None:
-            comp = self.sandbox.component_bus.get_component(str(address))
+            comp = self.sandbox.component_bus.get_component(
+                str(address),
+                auto_create=bool(self._booted and self.sandbox.component_bus.auto_mock_missing),
+            )
             if comp is not None:
                 return comp.get_doc(str(method))
         return f"function() -- {method}"
@@ -1269,6 +1302,9 @@ local function checkDeadline(event)
         """Execute user Lua code inside the booted OpenOS coroutine so yields bubble through `machine.lua`."""
         if not self._booted:
             self.boot()
+
+        if self.sandbox.component_bus is not None and self.sandbox.component_bus.auto_mock_missing:
+            self.sandbox.component_bus.scan_and_register_lua_declarations(str(lua_code))
 
         self._last_exec_result = None
         self.reset_call_budget()

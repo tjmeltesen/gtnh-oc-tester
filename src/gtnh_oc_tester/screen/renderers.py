@@ -31,11 +31,13 @@ def render_screen_text(emulator: GPUScreenEmulator, strip_trailing: bool = True)
     return "\n".join(lines)
 
 
-def render_screen_ansi(emulator: GPUScreenEmulator) -> str:
+def render_screen_ansi(emulator: GPUScreenEmulator, include_border: bool = False) -> str:
     page = emulator.screen_page
     out_lines: List[str] = []
+    if include_border:
+        out_lines.append("┌" + ("─" * page.width) + "┐")
     for row in page.cells:
-        parts: List[str] = []
+        parts: List[str] = ["│"] if include_border else []
         last_fg: Optional[int] = None
         last_bg: Optional[int] = None
         for cell in row:
@@ -47,7 +49,11 @@ def render_screen_ansi(emulator: GPUScreenEmulator) -> str:
                 last_bg = cell.bg
             parts.append(cell.char)
         parts.append("\x1b[0m")
+        if include_border:
+            parts.append("│")
         out_lines.append("".join(parts))
+    if include_border:
+        out_lines.append("└" + ("─" * page.width) + "┘")
     return "\n".join(out_lines)
 
 

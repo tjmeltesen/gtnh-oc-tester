@@ -17,21 +17,28 @@ pip install -e ".[window]"
 
 ## Live Interactive OpenOS Screen & Shell (`gtnh-oc-shell`)
 
-You can boot a live OpenComputers machine (`machine.lua` -> `bios.lua` -> OpenOS `/init.lua` -> `/bin/sh.lua`) to see the running OpenComputers screen, type shell commands (`ls`, `lua`, `edit`, `/home/myscript.lua`), paste via clipboard, and click/touch the screen in real time:
+You can boot a live OpenComputers machine (`machine.lua` -> `bios.lua` -> OpenOS `/init.lua` -> `/bin/sh.lua`) to see the running OpenComputers screen, type shell commands (`ls`, `lua`, `edit`, `/home/src/main.lua`), send control combos (`Ctrl+C` interrupt, `Ctrl+D` EOF, `Ctrl+L` clear, `Ctrl+W` delete word, `Ctrl+V` clipboard paste, `Tab` autocomplete, `Up`/`Down` history), and click/touch the screen in real time:
 
 ```bash
-# 1. Desktop Pygame Window (default when DISPLAY is available)
-gtnh-oc-shell --window --mount-home ./my_oc_scripts --attach me_controller --attach gt_machine
+# 1. Desktop Pygame Window (auto-scales to fit 82% of your monitor, resizable, Ctrl+- / Ctrl+= zoom)
+gtnh-oc-shell --window --resolution 80x25 --mount-home "C:\Users\tjmel\Downloads\backup_events_AE2MES" --attach me_controller --attach gt_machine
 
-# 2. Browser / Web UI at http://127.0.0.1:8080 (works locally or in headless Cloud VMs)
-gtnh-oc-shell --web --port 8080 --mount-home ./my_oc_scripts
+# 2. Browser / Web UI at http://127.0.0.1:8080 (fits 100vw x 100vh without overflow, direct canvas typing + Ctrl+C/D/V/W/L toolbar)
+gtnh-oc-shell --web --port 8080 --resolution 80x25 --mount-home "C:\Users\tjmel\Downloads\backup_events_AE2MES"
 
-# 3. Terminal 24-bit ANSI TUI directly in your console
+# 3. Terminal 24-bit ANSI TUI directly in your console (supports Windows msvcrt and POSIX termios)
 gtnh-oc-shell --terminal --mount-home ./my_oc_scripts
 
 # Or via gtnh-oc-test:
-gtnh-oc-test --interactive --mount-home ./my_oc_scripts
+gtnh-oc-test --interactive --resolution 80x25 --scale 1 --mount-home ./my_oc_scripts
 ```
+
+### Interactive Controls & Display Options
+
+- **`--resolution WIDTHxHEIGHT`**: Sets initial boot resolution (defaults to `80x25` for comfortable readability while keeping Tier 3 GPU `maxResolution()` at `160x50` when scripts call `gpu.setResolution(160, 50)`).
+- **`--scale N`**: Sets integer glyph scale (`1` or `2`). In `--window` mode, the Pygame window is resizable (`pygame.RESIZABLE`), automatically fits within `~82%` of your monitor's desktop dimensions, smoothly scales the rendered `font.hex` surface to the window with accurate mouse coordinate mapping (`touch`, `drag`, `drop`, `scroll`), and supports `Ctrl+-`, `Ctrl+=`, and `Ctrl+0` zoom hotkeys.
+- **Web UI Keyboard & Toolbar (`--web`)**: Focus the OpenComputers screen directly to type, use arrow keys (`Up`/`Down`/`Left`/`Right`), `Tab` autocomplete, `Ctrl+C` (queues `key_down` + OpenOS `interrupted` signal to stop running loops or cancel `term.read`), `Ctrl+D` (`EOF`), `Ctrl+W` (delete word), `Ctrl+L` (clear), and `Ctrl+V` (sends the OpenComputers `clipboard` signal), or use the on-screen control buttons.
+- **`--mount-home <path>`**: Recursively mounts any Windows or POSIX directory (e.g., `AE2MES` or `AE2-ES`) into `/home` in the OpenOS VFS and configures `package.path` so `require("src.Core")` and `require("lib.Item")` resolve out of `/home` automatically.
 
 ## Features
 

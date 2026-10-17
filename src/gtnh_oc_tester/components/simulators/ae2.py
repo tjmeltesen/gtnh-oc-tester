@@ -100,6 +100,9 @@ class AECraftingJobState:
         return False
 
     def __oc_lua_proxy__(self, sandbox: Any) -> Any:
+        factory = getattr(sandbox, "_proxy_factories", {}).get("ae_job")
+        if factory is not None:
+            return factory(self)
         factory = sandbox.lua.eval(
             """
             function(py_job)
@@ -195,33 +198,35 @@ class AECpuProxy:
         return target_sb.python_to_lua(stored) if target_sb else stored
 
     def __oc_lua_proxy__(self, sandbox: Any) -> Any:
-        factory = sandbox.lua.eval(
-            """
-            function(py_cpu, name, storage, coprocessors, sb)
-              local cpu = {
-                type = "userdata",
-                name = name,
-                storage = storage,
-                coprocessors = coprocessors,
-                busy = py_cpu.is_busy(),
-              }
-              function cpu.isBusy() return py_cpu.is_busy() end
-              function cpu.isActive() return py_cpu.is_active() end
-              function cpu.getStorage() return py_cpu.get_storage() end
-              function cpu. getCoprocessors() return py_cpu.get_coprocessors() end
-              function cpu.cancel()
-                local ok = py_cpu.cancel()
-                cpu.busy = py_cpu.is_busy()
-                return ok
-              end
-              function cpu.finalOutput() return py_cpu.final_output(sb) end
-              function cpu.activeItems() return py_cpu.active_items(sb) end
-              function cpu.pendingItems() return py_cpu.pending_items(sb) end
-              function cpu.storedItems() return py_cpu.stored_items(sb) end
-              return cpu
-            end
-            """.replace("cpu. getCoprocessors", "cpu.getCoprocessors")
-        )
+        factory = getattr(sandbox, "_proxy_factories", {}).get("ae_cpu")
+        if factory is None:
+            factory = sandbox.lua.eval(
+                """
+                function(py_cpu, name, storage, coprocessors, sb)
+                  local cpu = {
+                    type = "userdata",
+                    name = name,
+                    storage = storage,
+                    coprocessors = coprocessors,
+                    busy = py_cpu.is_busy(),
+                  }
+                  function cpu.isBusy() return py_cpu.is_busy() end
+                  function cpu.isActive() return py_cpu.is_active() end
+                  function cpu.getStorage() return py_cpu.get_storage() end
+                  function cpu.getCoprocessors() return py_cpu.get_coprocessors() end
+                  function cpu.cancel()
+                    local ok = py_cpu.cancel()
+                    cpu.busy = py_cpu.is_busy()
+                    return ok
+                  end
+                  function cpu.finalOutput() return py_cpu.final_output(sb) end
+                  function cpu.activeItems() return py_cpu.active_items(sb) end
+                  function cpu.pendingItems() return py_cpu.pending_items(sb) end
+                  function cpu.storedItems() return py_cpu.stored_items(sb) end
+                  return cpu
+                end
+                """
+            )
         return factory(
             self,
             str(self.cpu_dict.get("name", "")),
@@ -260,18 +265,20 @@ class AECraftableRecipe:
         )
 
     def __oc_lua_proxy__(self, sandbox: Any) -> Any:
-        factory = sandbox.lua.eval(
-            """
-            function(py_craftable, stack_tbl, sb)
-              local c = { type = "userdata" }
-              function c.getItemStack() return stack_tbl end
-              function c.request(amount, prioritizePower, cpuName)
-                return py_craftable.request_from_lua(amount or 1, prioritizePower, cpuName or "", sb)
-              end
-              return c
-            end
-            """
-        )
+        factory = getattr(sandbox, "_proxy_factories", {}).get("ae_craftable")
+        if factory is None:
+            factory = sandbox.lua.eval(
+                """
+                function(py_craftable, stack_tbl, sb)
+                  local c = { type = "userdata" }
+                  function c.getItemStack() return stack_tbl end
+                  function c.request(amount, prioritizePower, cpuName)
+                    return py_craftable.request_from_lua(amount or 1, prioritizePower, cpuName or "", sb)
+                  end
+                  return c
+                end
+                """
+            )
         return factory(self, sandbox.python_to_lua(self.get_item_stack()), sandbox)
 
     def request_from_lua(
@@ -612,17 +619,10 @@ class AE2NetworkComponent(SchemaBackedComponent):
         if self.bus and self.bus.sandbox:
             sb = self.bus.sandbox
             lua_tbl = sb.python_to_lua(items_snapshot)
-            return sb.lua.eval(
-                """
-                function(items)
-                  local idx = 0
-                  return function()
-                    idx = idx + 1
-                    return items[idx]
-                  end
-                end
-                """
-            )(lua_tbl)
+            factory = getattr(sb, "_proxy_factories", {}).get("all_items")
+            if factory is not None:
+                return factory(lua_tbl)
+            return lua_tbl
         idx = 0
 
         def _py_iter() -> Optional[Dict[str, Any]]:

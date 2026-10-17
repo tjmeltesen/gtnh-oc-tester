@@ -153,9 +153,6 @@ class OCLuaSandbox:
               if _G.string then
                 _G.string.dump = nil
               end
-              if _G.io then
-                _G.io.popen = nil
-              end
             end
             """
         )

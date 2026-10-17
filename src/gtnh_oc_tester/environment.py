@@ -306,10 +306,29 @@ class OCEnvironment:
         self,
         host_dir: str | Path,
         vfs_dir: str = "/home",
-        extensions: tuple[str, ...] = (".lua", ".txt", ".cfg", ".conf", ".json", ".lon", ".md"),
+        extensions: tuple[str, ...] = (
+            ".lua",
+            ".txt",
+            ".cfg",
+            ".conf",
+            ".json",
+            ".lon",
+            ".md",
+            ".yml",
+            ".yaml",
+            ".sh",
+            ".rc",
+            ".shrc",
+        ),
     ) -> list[str]:
         """Copy text/Lua files from a host directory into the OpenOS VFS (default `/home`)."""
-        src_root = Path(host_dir).resolve()
+        raw_str = str(host_dir).strip().strip('"').strip("'")
+        src_root = Path(raw_str)
+        if not src_root.exists() and "\\" in raw_str and "/" not in raw_str:
+            alt_root = Path(raw_str.replace("\\", "/"))
+            if alt_root.exists():
+                src_root = alt_root
+        src_root = src_root.resolve()
         mounted: list[str] = []
         if src_root.is_file():
             target = f"{vfs_dir.rstrip('/')}/{src_root.name}"
@@ -322,9 +341,13 @@ class OCEnvironment:
             if not path.is_file():
                 continue
             rel = path.relative_to(src_root)
-            if any(part.startswith(".") or part in ("__pycache__", "node_modules", ".git", "venv", ".venv") for part in rel.parts):
+            if any(
+                (part.startswith(".") and part not in (".shrc",))
+                or part in ("__pycache__", "node_modules", ".git", "venv", ".venv")
+                for part in rel.parts
+            ):
                 continue
-            if extensions and path.suffix.lower() not in extensions:
+            if extensions and path.suffix.lower() not in extensions and path.name not in (".shrc", "LICENSE", "Makefile"):
                 continue
             if path.stat().st_size > 256 * 1024:
                 continue
@@ -358,9 +381,12 @@ class OCEnvironment:
         self,
         char: str | int = 0,
         key_code: Optional[int] = None,
+        ctrl: bool = False,
+        alt: bool = False,
+        shift: bool = False,
         player: str = "player",
     ) -> None:
-        """Queue a `key_down` + `key_up` signal pair on the primary keyboard."""
+        """Queue a `key_down` + `key_up` signal pair (with optional modifier wrapping) on the primary keyboard."""
         if isinstance(char, str):
             ch_code = ord(char[0]) if char else 0
             k_code = (
@@ -370,15 +396,72 @@ class OCEnvironment:
             )
         else:
             ch_code = int(char)
-            ch_str = chr(ch_code) if 0 < ch_code < 128 else ""
+            if 1 <= ch_code <= 26 and key_code is None:
+                ch_str = chr(ord("a") + ch_code - 1)
+            else:
+                ch_str = chr(ch_code) if 0 < ch_code < 128 else ""
             k_code = (
                 int(key_code)
                 if key_code is not None
                 else _ASCII_TO_OC_KEYCODE.get(ch_str.lower(), 0)
             )
+        if ctrl and 97 <= ch_code <= 122:
+            ch_code = ch_code - 96
+        elif ctrl and 65 <= ch_code <= 90:
+            ch_code = ch_code - 64
+
         kb_addr = self.keyboard_comp.address
-        self.scheduler.push_signal("key_down", kb_addr, ch_code, k_code, str(player))
-        self.scheduler.push_signal("key_up", kb_addr, ch_code, k_code, str(player))
+        p_name = str(player)
+        if ctrl:
+            self.scheduler.push_signal("key_down", kb_addr, 0, 0x1D, p_name)
+        if alt:
+            self.scheduler.push_signal("key_down", kb_addr, 0, 0x38, p_name)
+        if shift:
+            self.scheduler.push_signal("key_down", kb_addr, 0, 0x2A, p_name)
+
+        self.scheduler.push_signal("key_down", kb_addr, ch_code, k_code, p_name)
+        if ctrl and k_code == 0x2E:
+            self.scheduler.push_signal("interrupted", self.scheduler.uptime())
+        self.scheduler.push_signal("key_up", kb_addr, ch_code, k_code, p_name)
+
+        if shift:
+            self.scheduler.push_signal("key_up", kb_addr, 0, 0x2A, p_name)
+        if alt:
+            self.scheduler.push_signal("key_up", kb_addr, 0, 0x38, p_name)
+        if ctrl:
+            self.scheduler.push_signal("key_up", kb_addr, 0, 0x1D, p_name)
+
+    def send_ctrl_c(self, step_ticks: int = 6, player: str = "player") -> str:
+        """Send OpenComputers Ctrl+C (`^C`, keycode 0x2E, char 3) + `interrupted` signal."""
+        self.send_key(3, key_code=0x2E, ctrl=True, player=player)
+        if step_ticks > 0 and self.sandbox.machine_host._interactive_mode:
+            self.step_interactive_tick(step_ticks)
+        return self.screen.to_text()
+
+    def send_ctrl_d(self, step_ticks: int = 6, player: str = "player") -> str:
+        """Send OpenComputers Ctrl+D (`^D` EOF, keycode 0x20, char 4) with `lcontrol` held."""
+        self.send_key(4, key_code=0x20, ctrl=True, player=player)
+        if step_ticks > 0 and self.sandbox.machine_host._interactive_mode:
+            self.step_interactive_tick(step_ticks)
+        return self.screen.to_text()
+
+    def send_ctrl_w(self, step_ticks: int = 4, player: str = "player") -> str:
+        """Send OpenComputers Ctrl+W (delete previous word in `core/cursor.lua`)."""
+        self.send_key(23, key_code=0x11, ctrl=True, player=player)
+        if step_ticks > 0 and self.sandbox.machine_host._interactive_mode:
+            self.step_interactive_tick(step_ticks)
+        return self.screen.to_text()
+
+    def send_ctrl_l(self, step_ticks: int = 6, player: str = "player") -> str:
+        """Clear the interactive OpenOS terminal screen (Ctrl+L)."""
+        self.send_key(12, key_code=0x26, ctrl=True, player=player)
+        try:
+            self.sandbox.lua.execute('require("term").clear()')
+        except Exception:
+            pass
+        if step_ticks > 0 and self.sandbox.machine_host._interactive_mode:
+            self.step_interactive_tick(step_ticks)
+        return self.screen.to_text()
 
     def send_clipboard(self, text: str, player: str = "player") -> None:
         """Queue a `clipboard` paste signal on the primary keyboard."""

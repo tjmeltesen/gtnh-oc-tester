@@ -39,33 +39,35 @@ class StackSlotUserdata:
 
     def __oc_lua_proxy__(self, sandbox: Any) -> Any:
         lua_slots = sandbox.python_to_lua([dict(s) if s else {} for s in self.slots])
-        factory = sandbox.lua.eval(
-            """
-            function(slots_tbl, count_val)
-              local idx = 0
-              local obj = {}
-              function obj.reset() idx = 0 end
-              function obj.count() return count_val end
-              function obj.getAll()
-                local all = {}
-                all[0] = slots_tbl[1] or {}
-                for i = 1, count_val do
-                  all[i] = slots_tbl[i] or {}
-                end
-                return all
-              end
-              return setmetatable(obj, {
-                __call = function()
-                  idx = idx + 1
-                  if idx <= count_val then
-                    return slots_tbl[idx] or {}
+        factory = getattr(sandbox, "_proxy_factories", {}).get("inv_stack_iter")
+        if factory is None:
+            factory = sandbox.lua.eval(
+                """
+                function(slots_tbl, count_val)
+                  local idx = 0
+                  local obj = {}
+                  function obj.reset() idx = 0 end
+                  function obj.count() return count_val end
+                  function obj.getAll()
+                    local all = {}
+                    all[0] = slots_tbl[1] or {}
+                    for i = 1, count_val do
+                      all[i] = slots_tbl[i] or {}
+                    end
+                    return all
                   end
-                  return nil
+                  return setmetatable(obj, {
+                    __call = function()
+                      idx = idx + 1
+                      if idx <= count_val then
+                        return slots_tbl[idx] or {}
+                      end
+                      return nil
+                    end
+                  })
                 end
-              })
-            end
-            """
-        )
+                """
+            )
         return factory(lua_slots, len(self.slots))
 
 

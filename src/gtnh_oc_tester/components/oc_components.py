@@ -688,20 +688,22 @@ class MockInternetHandle:
         return self.url_or_address
 
     def __oc_lua_proxy__(self, sandbox: Any) -> Any:
-        factory = sandbox.lua.eval(
-            """
-            function(py_handle, headers_tbl)
-              local h = { type = "userdata" }
-              function h.read(n) return py_handle.read(n) end
-              function h.write(data) return py_handle.write(data) end
-              function h.response() return py_handle.status_code, py_handle.status_message, headers_tbl end
-              function h.finishConnect() return py_handle.finishConnect() end
-              function h.close() py_handle.close() end
-              function h.id() return py_handle.id() end
-              return h
-            end
-            """
-        )
+        factory = getattr(sandbox, "_proxy_factories", {}).get("internet_handle")
+        if factory is None:
+            factory = sandbox.lua.eval(
+                """
+                function(py_handle, headers_tbl)
+                  local h = { type = "userdata" }
+                  function h.read(n) return py_handle.read(n) end
+                  function h.write(data) return py_handle.write(data) end
+                  function h.response() return py_handle.status_code, py_handle.status_message, headers_tbl end
+                  function h.finishConnect() return py_handle.finishConnect() end
+                  function h.close() py_handle.close() end
+                  function h.id() return py_handle.id() end
+                  return h
+                end
+                """
+            )
         return factory(self, sandbox.python_to_lua(self.headers))
 
 

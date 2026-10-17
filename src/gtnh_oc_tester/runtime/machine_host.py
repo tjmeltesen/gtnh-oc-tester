@@ -53,6 +53,10 @@ do
   local fs = require("filesystem")
   local shell = require("shell")
   local process = require("process")
+  local package = require("package")
+
+  -- Extend package.path so mounted /home projects (e.g. AE2MES & AE2-ES with src/ and lib/ subdirs) resolve cleanly
+  package.path = package.path .. ";/home/?.lua;/home/?/init.lua;/home/src/?.lua;/home/src/?/init.lua;/home/lib/?.lua;/home/lib/?/init.lua;./src/?.lua;./lib/?.lua"
 
   -- Ensure process.findProcess falls back to the root init process if invoked from host eval
   local init_proc = process.info()
@@ -95,22 +99,35 @@ do
   _G.unicode = unicode
   fs.makeDirectory("/home")
   shell.setWorkingDirectory("/home")
+  os.setenv("PWD", "/home")
 
   _G.runlevel = 1
   event.push("init")
   event.pull(0, "init")
+  if __oc_initial_w and __oc_initial_h then
+    local gpu_addr = component.list("gpu", true)()
+    if gpu_addr then
+      pcall(component.invoke, gpu_addr, "setResolution", __oc_initial_w, __oc_initial_h)
+    end
+  end
   require("term").clear()
 
   if rawget(_G, "__oc_interactive_shell") then
     while true do
-      local result, reason = xpcall(require("shell").getShell(), function(msg)
-        return tostring(msg) .. "\n" .. debug.traceback()
-      end)
-      if not result then
-        io.stderr:write((reason ~= nil and tostring(reason) or "unknown error") .. "\n")
-        io.write("Press any key to continue.\n")
+      local sh_fn, sh_reason = require("shell").getShell()
+      if not sh_fn then
+        io.stderr:write((sh_reason ~= nil and tostring(sh_reason) or "cannot load shell") .. "\n")
         os.sleep(0.5)
-        require("event").pull("key")
+      else
+        local result, reason = xpcall(sh_fn, function(msg)
+          if type(msg) == "table" and msg.reason == "terminated" then
+            return nil
+          end
+          return tostring(msg) .. "\n" .. debug.traceback()
+        end)
+        if not result and reason then
+          io.stderr:write(tostring(reason) .. "\n")
+        end
       end
     end
   end
@@ -119,14 +136,20 @@ do
     local sig = table.pack(__oc_raw_pull(0))
     if sig[1] == "__host_interactive_shell" then
       while true do
-        local result, reason = xpcall(require("shell").getShell(), function(msg)
-          return tostring(msg) .. "\n" .. debug.traceback()
-        end)
-        if not result then
-          io.stderr:write((reason ~= nil and tostring(reason) or "unknown error") .. "\n")
-          io.write("Press any key to continue.\n")
+        local sh_fn, sh_reason = require("shell").getShell()
+        if not sh_fn then
+          io.stderr:write((sh_reason ~= nil and tostring(sh_reason) or "cannot load shell") .. "\n")
           os.sleep(0.5)
-          require("event").pull("key")
+        else
+          local result, reason = xpcall(sh_fn, function(msg)
+            if type(msg) == "table" and msg.reason == "terminated" then
+              return nil
+            end
+            return tostring(msg) .. "\n" .. debug.traceback()
+          end)
+          if not result and reason then
+            io.stderr:write(tostring(reason) .. "\n")
+          end
         end
       end
     elseif sig[1] == "__host_exec" then
@@ -238,12 +261,15 @@ class OCMachineHost:
         # Patch /init.lua to capture raw computer.pullSignal and one-shot host hooks in local upvalues
         # before event.lua or any user script runs, so _G / _ENV never expose host callbacks.
         marker = "while true do\n  local result, reason = xpcall(require(\"shell\").getShell()"
+        init_w = getattr(self.sandbox.gpu_screen, "initial_width", None)
+        init_h = getattr(self.sandbox.gpu_screen, "initial_height", None)
         header = (
             "local __oc_raw_pull = computer.pullSignal\n"
             "local __oc_take_hooks = computer.__oc_take_host_hooks\n"
             "computer.__oc_take_host_hooks = nil\n"
             "local __oc_record_result, __oc_on_event_error = __oc_take_hooks()\n"
             "__oc_take_hooks = nil\n"
+            f"local __oc_initial_w, __oc_initial_h = {int(init_w) if init_w else 'nil'}, {int(init_h) if init_h else 'nil'}\n"
         )
         patched_init = header + init_src.replace(
             marker,
@@ -811,6 +837,15 @@ class OCMachineHost:
                 "clock = function() return computer.uptime() end,",
             )
             .replace(
+                "date = function(format, time)\n      return spcall(os.date, format, time)\n    end,",
+                """date = function(format, time)
+      if type(format) == "string" then
+        format = format:gsub("%%F", "%%Y-%%m-%%d"):gsub("%%T", "%%H:%%M:%%S")
+      end
+      return spcall(os.date, format, time)
+    end,""",
+            )
+            .replace(
                 "local function checkDeadline()\n  if computer.realTime() > deadline then",
                 """local _trace_ignored = {
   checkArg = true, pairs = true, ipairs = true, next = true,
@@ -1028,6 +1063,123 @@ local function checkDeadline(event)
             self._baseline_memory + int(self.total_memory_bytes * self.ram_scale_for_64bit)
         )
 
+        # Pre-compile host-side component proxy factories (outside user RAM budget)
+        # so component callbacks invoked inside child coroutines never re-enter `lua.eval()`.
+        before_host_helpers = self.lua.get_memory_used()
+        self.sandbox._proxy_factories = {
+            "all_items": self.lua.eval(
+                r"""
+                function(items)
+                  local idx = 0
+                  return setmetatable(items, {
+                    __call = function()
+                      idx = idx + 1
+                      return items[idx]
+                    end
+                  })
+                end
+                """
+            ),
+            "ae_job": self.lua.eval(
+                r"""
+                function(py_job)
+                  local job = { type = "userdata" }
+                  function job.isComputing() return py_job.is_computing() end
+                  function job.hasFailed() return py_job.has_failed() end
+                  function job.isCanceled() return py_job.is_canceled() end
+                  function job.isDone() return py_job.is_done() end
+                  function job.cancel() return py_job.cancel() end
+                  return job
+                end
+                """
+            ),
+            "ae_cpu": self.lua.eval(
+                r"""
+                function(py_cpu, name, storage, coprocessors, sb)
+                  local cpu = {
+                    type = "userdata",
+                    name = name,
+                    storage = storage,
+                    coprocessors = coprocessors,
+                    busy = py_cpu.is_busy(),
+                  }
+                  function cpu.isBusy() return py_cpu.is_busy() end
+                  function cpu.isActive() return py_cpu.is_active() end
+                  function cpu.getStorage() return py_cpu.get_storage() end
+                  function cpu.getCoprocessors() return py_cpu.get_coprocessors() end
+                  function cpu.cancel()
+                    local ok = py_cpu.cancel()
+                    cpu.busy = py_cpu.is_busy()
+                    return ok
+                  end
+                  function cpu.finalOutput() return py_cpu.final_output(sb) end
+                  function cpu.activeItems() return py_cpu.active_items(sb) end
+                  function cpu.pendingItems() return py_cpu.pending_items(sb) end
+                  function cpu.storedItems() return py_cpu.stored_items(sb) end
+                  return cpu
+                end
+                """
+            ),
+            "ae_craftable": self.lua.eval(
+                r"""
+                function(py_craftable, stack_tbl, sb)
+                  local c = { type = "userdata" }
+                  function c.getItemStack() return stack_tbl end
+                  function c.request(amount, prioritizePower, cpuName)
+                    return py_craftable.request_from_lua(amount or 1, prioritizePower, cpuName or "", sb)
+                  end
+                  return c
+                end
+                """
+            ),
+            "inv_stack_iter": self.lua.eval(
+                r"""
+                function(slots_tbl, count_val)
+                  local idx = 0
+                  local obj = {}
+                  function obj.reset() idx = 0 end
+                  function obj.count() return count_val end
+                  function obj.getAll()
+                    local all = {}
+                    all[0] = slots_tbl[1] or {}
+                    for i = 1, count_val do
+                      all[i] = slots_tbl[i] or {}
+                    end
+                    return all
+                  end
+                  return setmetatable(obj, {
+                    __call = function()
+                      idx = idx + 1
+                      if idx <= count_val then
+                        return slots_tbl[idx] or {}
+                      end
+                      return nil
+                    end
+                  })
+                end
+                """
+            ),
+            "internet_handle": self.lua.eval(
+                r"""
+                function(py_handle, headers_tbl)
+                  local h = { type = "userdata" }
+                  function h.read(n) return py_handle.read(n) end
+                  function h.write(data) return py_handle.write(data) end
+                  function h.response() return py_handle.status_code, py_handle.status_message, headers_tbl end
+                  function h.finishConnect() return py_handle.finishConnect() end
+                  function h.close() py_handle.close() end
+                  function h.id() return py_handle.id() end
+                  return h
+                end
+                """
+            ),
+        }
+        host_helper_delta = max(0, self.lua.get_memory_used() - before_host_helpers)
+        self._baseline_memory += host_helper_delta
+        self.lua.set_max_memory(
+            self._baseline_memory + int(self.total_memory_bytes * self.ram_scale_for_64bit)
+        )
+
         # Wrap `print` and `io.write` so `sandbox.stdout_lines` also captures printed lines
         self.lua.execute(
             r"""
@@ -1044,9 +1196,6 @@ local function checkDeadline(event)
                   __oc_capture_stdout(table.concat(parts, "\t") .. "\n")
                 end
                 return orig_print(...)
-              end
-              if sb.io and sb.io.popen then
-                sb.io.popen = nil
               end
             end
             """

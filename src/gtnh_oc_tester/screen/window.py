@@ -218,15 +218,20 @@ def _int_to_rgb(color: int) -> Tuple[int, int, int]:
 
 def _event_char_code(event: pygame.event.Event) -> int:
     """Resolve OpenComputers integer character code from a Pygame key event."""
+    key = int(getattr(event, "key", 0))
+    mod = int(getattr(event, "mod", 0))
+    ctrl = bool(mod & getattr(pygame, "KMOD_CTRL", 0))
+
+    if ctrl and pygame.K_a <= key <= pygame.K_z:
+        return key - pygame.K_a + 1
+
     uni = getattr(event, "unicode", "")
     if isinstance(uni, str) and len(uni) > 0:
         return ord(uni[0])
 
-    key = int(getattr(event, "key", 0))
     if key in _CONTROL_CHAR_CODES:
         return _CONTROL_CHAR_CODES[key]
 
-    mod = int(getattr(event, "mod", 0))
     shift = bool(mod & (pygame.KMOD_SHIFT | getattr(pygame, "KMOD_CAPS", 0)))
     if pygame.K_a <= key <= pygame.K_z:
         ch = chr(key)
@@ -236,6 +241,31 @@ def _event_char_code(event: pygame.event.Event) -> int:
     if 0x20 <= key <= 0x7E:
         return key
     return 0
+
+
+def _read_system_clipboard() -> str:
+    """Best-effort cross-platform clipboard read for Ctrl+V in the Pygame window."""
+    if pygame is not None and hasattr(pygame, "scrap"):
+        try:
+            if not pygame.scrap.get_init():
+                pygame.scrap.init()
+            raw = pygame.scrap.get(pygame.SCRAP_TEXT)
+            if raw:
+                return raw.decode("utf-8", errors="ignore").rstrip("\x00")
+        except Exception:
+            pass
+    try:
+        import tkinter as tk
+
+        root = tk.Tk()
+        root.withdraw()
+        text = root.clipboard_get()
+        root.destroy()
+        if text:
+            return str(text)
+    except Exception:
+        pass
+    return ""
 
 
 def _translate_mouse_button(pg_button: int) -> Optional[int]:
@@ -262,6 +292,9 @@ class OCPygameWindow:
         scheduler: Optional[Any] = None,
         jar_loader: Optional[OCJarLoader] = None,
         scale: int = 2,
+        auto_fit: Optional[bool] = None,
+        resizable: bool = True,
+        max_desktop_fraction: float = 0.82,
         headless: bool = False,
         player_name: str = "player",
         keyboard_address: Optional[str] = None,
@@ -288,6 +321,8 @@ class OCPygameWindow:
         )
         self.font_renderer = FontHexRenderer(jar_loader=self.jar_loader)
         self.scale = max(1, int(scale))
+        self.resizable = bool(resizable)
+        self.max_desktop_fraction = max(0.3, min(0.98, float(max_desktop_fraction)))
         self.player_name = str(player_name)
         self.title = str(title)
         self._explicit_keyboard_address = keyboard_address
@@ -300,6 +335,7 @@ class OCPygameWindow:
             and not os.environ.get("WAYLAND_DISPLAY")
         )
         self.headless = bool(headless or no_display)
+        self.auto_fit = (not self.headless) if auto_fit is None else bool(auto_fit)
         if self.headless:
             os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
             os.environ.setdefault("SDL_AUDIODRIVER", "dummy")
@@ -313,12 +349,30 @@ class OCPygameWindow:
         if not pygame.display.get_init():
             pygame.display.init()
 
+        self._desktop_size: Tuple[int, int] = self._detect_desktop_size()
         self._surface_size: Tuple[int, int] = (0, 0)
+        self._logical_size: Tuple[int, int] = (0, 0)
+        self._user_resized_size: Optional[Tuple[int, int]] = None
+        self._zoom_factor: float = 1.0
+        self._viewport_rect: Tuple[int, int, int, int] = (0, 0, 1, 1)
         self._display_surface: Optional[pygame.Surface] = None
+        self._logical_surface: Optional[pygame.Surface] = None
         self._glyph_cache: Dict[Tuple[int, int, int, int, int], pygame.Surface] = {}
         self._pressed_mouse_button: Optional[int] = None
         self._clock = pygame.time.Clock()
         self._ensure_display_surface()
+
+    def _detect_desktop_size(self) -> Tuple[int, int]:
+        """Detect the host monitor pixel size before opening the Pygame window."""
+        try:
+            info = pygame.display.Info()
+            w = int(getattr(info, "current_w", 0) or 0)
+            h = int(getattr(info, "current_h", 0) or 0)
+            if w >= 640 and h >= 480:
+                return (w, h)
+        except Exception:
+            pass
+        return (1920, 1080)
 
     @property
     def cell_pixel_width(self) -> int:
@@ -377,18 +431,52 @@ class OCPygameWindow:
 
         return (fg, bg)
 
+    def _compute_target_window_size(self, logical_w: int, logical_h: int) -> Tuple[int, int]:
+        if self._user_resized_size is not None:
+            return self._user_resized_size
+        scaled_w = max(160, int(round(logical_w * self._zoom_factor)))
+        scaled_h = max(100, int(round(logical_h * self._zoom_factor)))
+        if not self.auto_fit:
+            return (scaled_w, scaled_h)
+        desk_w, desk_h = self._desktop_size
+        max_w = max(320, int(desk_w * self.max_desktop_fraction))
+        max_h = max(240, int(desk_h * self.max_desktop_fraction))
+        if scaled_w <= max_w and scaled_h <= max_h:
+            return (scaled_w, scaled_h)
+        fit_ratio = min(max_w / max(1, scaled_w), max_h / max(1, scaled_h))
+        return (
+            max(160, int(round(scaled_w * fit_ratio))),
+            max(100, int(round(scaled_h * fit_ratio))),
+        )
+
     def _ensure_display_surface(self) -> pygame.Surface:
         page = self.screen.screen_page
-        px_w = max(1, page.width) * self.cell_pixel_width
-        px_h = max(1, page.height) * self.cell_pixel_height
-        target_size = (px_w, px_h)
+        logical_w = max(1, page.width) * self.cell_pixel_width
+        logical_h = max(1, page.height) * self.cell_pixel_height
+        logical_size = (logical_w, logical_h)
+
+        if self._logical_surface is None or self._logical_size != logical_size:
+            if self._logical_size != (0, 0) and self._logical_size != logical_size:
+                # Reset manual window size when OpenOS changes GPU resolution (e.g. 160x50 -> 80x25)
+                self._user_resized_size = None
+            self._logical_size = logical_size
+            self._logical_surface = pygame.Surface(logical_size)
+
+        target_size = self._compute_target_window_size(logical_w, logical_h)
         if self._display_surface is None or self._surface_size != target_size:
             self._surface_size = target_size
-            self._display_surface = pygame.display.set_mode(target_size)
+            flags = pygame.RESIZABLE if (self.resizable and not self.headless) else 0
+            self._display_surface = pygame.display.set_mode(target_size, flags)
             pygame.display.set_caption(
-                f"{self.title} [{page.width}x{page.height} {self.screen.depth}-bit]"
+                f"{self.title} [{page.width}x{page.height} {self.screen.depth}-bit | Ctrl+C Interrupt | Ctrl+V Paste | Ctrl+-/= Zoom]"
             )
         return self._display_surface
+
+    def set_zoom(self, zoom_factor: float) -> None:
+        """Adjust window zoom factor and resize the display window accordingly."""
+        self._zoom_factor = max(0.25, min(4.0, float(zoom_factor)))
+        self._user_resized_size = None
+        self._ensure_display_surface()
 
     def _get_glyph_surface(
         self,
@@ -439,13 +527,17 @@ class OCPygameWindow:
 
     def render_frame(self) -> pygame.Surface:
         """Render the active screen buffer (`page 0`) onto the Pygame window surface."""
-        surface = self._ensure_display_surface()
+        display_surface = self._ensure_display_surface()
+        assert self._logical_surface is not None
+        logical_surface = self._logical_surface
         page = self.screen.screen_page
 
         if not self.screen.screen_on:
-            surface.fill((0, 0, 0))
+            logical_surface.fill((0, 0, 0))
+            display_surface.fill((0, 0, 0))
+            self._viewport_rect = (0, 0, self._surface_size[0], self._surface_size[1])
             pygame.display.flip()
-            return surface
+            return display_surface
 
         cell_w = self.cell_pixel_width
         cell_h = self.cell_pixel_height
@@ -471,10 +563,29 @@ class OCPygameWindow:
                     cells_span = 1
 
                 tile = self._get_glyph_surface(cp, fg_color, bg_color, cells_span)
-                surface.blit(tile, (px, py))
+                logical_surface.blit(tile, (px, py))
+
+        win_w, win_h = self._surface_size
+        log_w, log_h = self._logical_size
+        if (win_w, win_h) == (log_w, log_h):
+            display_surface.blit(logical_surface, (0, 0))
+            self._viewport_rect = (0, 0, log_w, log_h)
+        else:
+            display_surface.fill((12, 15, 22))
+            scale_ratio = min(win_w / max(1, log_w), win_h / max(1, log_h))
+            vp_w = max(1, int(round(log_w * scale_ratio)))
+            vp_h = max(1, int(round(log_h * scale_ratio)))
+            vp_x = (win_w - vp_w) // 2
+            vp_y = (win_h - vp_h) // 2
+            self._viewport_rect = (vp_x, vp_y, vp_w, vp_h)
+            try:
+                scaled = pygame.transform.smoothscale(logical_surface, (vp_w, vp_h))
+            except Exception:
+                scaled = pygame.transform.scale(logical_surface, (vp_w, vp_h))
+            display_surface.blit(scaled, (vp_x, vp_y))
 
         pygame.display.flip()
-        return surface
+        return display_surface
 
     def _emit_signal(self, name: str, *args: Any) -> None:
         if self.env is not None and hasattr(self.env, "push_event"):
@@ -485,14 +596,23 @@ class OCPygameWindow:
     def pixel_to_cell(self, px: int, py: int) -> Tuple[int | float, int | float]:
         """Convert window pixel coordinates `(px, py)` to 1-indexed OpenComputers screen cell coordinates."""
         page = self.screen.screen_page
-        cw = max(1, self.cell_pixel_width)
-        ch = max(1, self.cell_pixel_height)
+        vp_x, vp_y, vp_w, vp_h = self._viewport_rect
+        if vp_w <= 1 or vp_h <= 1:
+            vp_x, vp_y = 0, 0
+            vp_w = max(1, page.width * self.cell_pixel_width)
+            vp_h = max(1, page.height * self.cell_pixel_height)
+
+        rel_x = max(0.0, min(float(vp_w) - 0.001, float(px - vp_x)))
+        rel_y = max(0.0, min(float(vp_h) - 0.001, float(py - vp_y)))
+        norm_x = rel_x / float(vp_w)
+        norm_y = rel_y / float(vp_h)
+
         if self.screen.precise_mode:
-            cx = max(1.0, min(float(page.width), (float(px) / cw) + 1.0))
-            cy = max(1.0, min(float(page.height), (float(py) / ch) + 1.0))
+            cx = max(1.0, min(float(page.width), norm_x * float(page.width) + 1.0))
+            cy = max(1.0, min(float(page.height), norm_y * float(page.height) + 1.0))
             return (round(cx, 3), round(cy, 3))
-        cx_i = max(1, min(page.width, int(px) // cw + 1))
-        cy_i = max(1, min(page.height, int(py) // ch + 1))
+        cx_i = max(1, min(page.width, int(norm_x * page.width) + 1))
+        cy_i = max(1, min(page.height, int(norm_y * page.height) + 1))
         return (cx_i, cy_i)
 
     def handle_event(self, event: pygame.event.Event) -> bool:
@@ -500,8 +620,36 @@ class OCPygameWindow:
         if event.type == pygame.QUIT:
             return False
 
+        if hasattr(pygame, "VIDEORESIZE") and event.type == pygame.VIDEORESIZE:
+            new_w = max(160, int(getattr(event, "w", self._surface_size[0])))
+            new_h = max(100, int(getattr(event, "h", self._surface_size[1])))
+            self._user_resized_size = (new_w, new_h)
+            self._ensure_display_surface()
+            return True
+
         if event.type == pygame.KEYDOWN:
             key = int(getattr(event, "key", 0))
+            mod = int(getattr(event, "mod", 0))
+            ctrl = bool(mod & getattr(pygame, "KMOD_CTRL", 0))
+
+            # Window zoom hotkeys: Ctrl+- (zoom out), Ctrl+= / Ctrl++ (zoom in), Ctrl+0 (reset fit)
+            if ctrl and key in (pygame.K_MINUS, pygame.K_KP_MINUS):
+                self.set_zoom(self._zoom_factor * 0.85)
+                return True
+            if ctrl and key in (pygame.K_EQUALS, pygame.K_PLUS, pygame.K_KP_PLUS):
+                self.set_zoom(self._zoom_factor * 1.15)
+                return True
+            if ctrl and key == pygame.K_0:
+                self.set_zoom(1.0)
+                return True
+
+            # Ctrl+V: emit OpenComputers `clipboard` signal if clipboard text is available
+            if ctrl and key == pygame.K_v:
+                pasted = _read_system_clipboard()
+                if pasted:
+                    self._emit_signal("clipboard", self.keyboard_address, pasted, self.player_name)
+                    return True
+
             oc_keycode = PYGAME_TO_OC_KEYCODE.get(key, 0)
             char_code = _event_char_code(event)
             self._emit_signal(
@@ -511,6 +659,10 @@ class OCPygameWindow:
                 oc_keycode,
                 self.player_name,
             )
+            # In OpenOS, Ctrl+C (or Ctrl+Alt+C) also triggers `interrupted`
+            if ctrl and key == pygame.K_c:
+                uptime = self.scheduler.uptime() if self.scheduler and hasattr(self.scheduler, "uptime") else 0.0
+                self._emit_signal("interrupted", uptime)
             return True
 
         if event.type == pygame.KEYUP:

@@ -72,9 +72,13 @@ def test_wp2_sandbox_security_isolation(tmp_path: Path) -> None:
         assert(_G.__oc_comp_bridge == nil, "_G.__oc_comp_bridge leaked into sandbox")
         assert(require("computer").__oc_take_host_hooks == nil, "__oc_take_host_hooks leaked")
 
-        -- 2. io.popen and string.dump must be nil
-        assert(io.popen == nil, "io.popen must be nil")
+        -- 2. string.dump must be nil; io.popen must be OpenOS's internal VFS pipe (never host shell)
         assert(string.dump == nil, "string.dump must be nil")
+        assert(type(io.popen) == "function", "OpenOS internal io.popen should be available for shell backticks")
+        local p = io.popen("echo OPENOS_VFS_PIPE")
+        if p then
+          p:close()
+        end
 
         -- 3. debug must only expose getinfo, traceback, getlocal, getupvalue
         assert(type(debug.getinfo) == "function")
@@ -694,6 +698,114 @@ def test_interactive_openos_shell_and_web_server(tmp_path: Path) -> None:
         with urlopen(req, timeout=5) as resp:
             updated = json.loads(resp.read().decode("utf-8"))
         assert "WEB_CMD_99" in updated["screen_text"]
+
+        # Verify Web UI Ctrl+C (interrupt) stops a running foreground loop and returns to `/home #`
+        req_loop = Request(
+            f"{url}/api/input",
+            data=json.dumps(
+                {"action": "text", "text": 'lua -e "while true do os.sleep(0.2) end"', "press_enter": True}
+            ).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urlopen(req_loop, timeout=5) as resp:
+            json.loads(resp.read().decode("utf-8"))
+
+        req_ctrlc = Request(
+            f"{url}/api/input",
+            data=json.dumps({"action": "interrupt"}).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urlopen(req_ctrlc, timeout=5) as resp:
+            after_ctrlc = json.loads(resp.read().decode("utf-8"))
+        assert "/home #" in after_ctrlc["screen_text"]
+
+        # Verify Web UI Ctrl+D (EOF) exits interactive `lua` REPL back to `/home #`
+        req_repl = Request(
+            f"{url}/api/input",
+            data=json.dumps({"action": "text", "text": "lua", "press_enter": True}).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urlopen(req_repl, timeout=5) as resp:
+            in_repl = json.loads(resp.read().decode("utf-8"))
+        assert "lua>" in in_repl["screen_text"]
+
+        req_ctrld = Request(
+            f"{url}/api/input",
+            data=json.dumps({"action": "eof"}).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urlopen(req_ctrld, timeout=5) as resp:
+            after_ctrld = json.loads(resp.read().decode("utf-8"))
+        assert "/home #" in after_ctrld["screen_text"]
     finally:
         srv.stop()
+
+
+def test_interactive_terminal_tui_window_sizing_and_ae2mes_compat(tmp_path: Path) -> None:
+    """Verify terminal TUI border rendering, Pygame auto-fit sizing, and AE2MES `allItems()` + `require` compatibility."""
+    from gtnh_oc_tester.screen.renderers import render_screen_ansi
+    from gtnh_oc_tester.screen.window import OCPygameWindow
+
+    proj_dir = tmp_path / "backup_events_AE2MES"
+    (proj_dir / "src").mkdir(parents=True)
+    (proj_dir / "lib").mkdir(parents=True)
+    (proj_dir / "lib" / "Helper.lua").write_text(
+        "return { tag = 'AE2MES_HELPER_OK' }\n",
+        encoding="utf-8",
+    )
+    (proj_dir / "src" / "check_me.lua").write_text(
+        r"""
+        local component = require("component")
+        local Helper = require("Helper")
+        local me = component.me_controller
+        local all_tbl = me.allItems()
+        local count_len = #all_tbl
+        local iter_count = 0
+        for item in all_tbl do
+          iter_count = iter_count + 1
+        end
+        print(Helper.tag .. ":" .. tostring(count_len) .. ":" .. tostring(iter_count))
+        """,
+        encoding="utf-8",
+    )
+
+    env = OCEnvironment(screen_width=80, screen_height=25)
+    env.attach("me_controller")
+    env.me_network.add_item("minecraft:iron_ingot", size=256, label="Iron Ingot")
+    env.me_network.add_item("minecraft:copper_ingot", size=128, label="Copper Ingot")
+
+    env.start_interactive_shell(mount_home=proj_dir)
+    assert env.screen.width == 80 and env.screen.height == 25
+
+    # Verify ANSI border rendering used by `run_terminal_tui`
+    ansi_bordered = render_screen_ansi(env.screen, include_border=True)
+    assert "┌" in ansi_bordered and "┘" in ansi_bordered
+
+    # Run mounted AE2MES-style script from `/home` using `src/` and `lib/` module resolution and `allItems()`
+    out = env.send_text("src/check_me.lua", press_enter=True, step_ticks=25)
+    assert "AE2MES_HELPER_OK:2:2" in out
+
+    # Verify `date` (%F %T in Lua 5.2) and `reset` (backtick `io.popen`) work in interactive shell
+    out_date = env.send_text("date", press_enter=True, step_ticks=15)
+    assert "/home #" in out_date
+
+    # Verify Pygame window auto-fit scaling and coordinate mapping when resized
+    win = OCPygameWindow(env, scale=2, auto_fit=True, headless=True)
+    try:
+        win._desktop_size = (1366, 768)
+        env.screen.set_resolution(160, 50)
+        win.render_frame()
+        # 160x50 at scale=2 is 2560x1600, which must auto-fit inside 82% of 1366x768
+        assert win._surface_size[0] <= int(1366 * 0.85)
+        assert win._surface_size[1] <= int(768 * 0.85)
+        vp_x, vp_y, vp_w, vp_h = win._viewport_rect
+        assert win.pixel_to_cell(vp_x + 1, vp_y + 1) == (1, 1)
+        assert win.pixel_to_cell(vp_x + vp_w - 1, vp_y + vp_h - 1) == (160, 50)
+    finally:
+        win.close()
+
 

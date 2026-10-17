@@ -10,6 +10,22 @@ from ..specs.registry import ResolvedComponentSchema, SchemaRegistry, get_defaul
 from .abstracts import DriverAbstractMixin
 
 
+def _sanitize_for_record(value: Any) -> Any:
+    """Convert or summarize Lupa Lua references so Python call logs never hold raw Lua GC refs across coroutines."""
+    if value is None or isinstance(value, (bool, int, float, str, bytes)):
+        return value
+    if isinstance(value, tuple):
+        return tuple(_sanitize_for_record(v) for v in value)
+    if isinstance(value, list):
+        return [_sanitize_for_record(v) for v in value]
+    if isinstance(value, dict):
+        return {_sanitize_for_record(k): _sanitize_for_record(v) for k, v in value.items()}
+    cls_mod = getattr(type(value), "__module__", "")
+    if "lupa" in cls_mod:
+        return f"<{type(value).__name__}>"
+    return value
+
+
 @dataclass
 class ComponentCallRecord:
     tick: int
@@ -99,8 +115,8 @@ class SchemaBackedComponent(DriverAbstractMixin):
             address=self.address,
             component_type=self.component_type,
             method=method_name,
-            args=args,
-            result=result,
+            args=_sanitize_for_record(args),
+            result=_sanitize_for_record(result),
             state_mutation=mutation_note,
         )
         self.call_history.append(rec)

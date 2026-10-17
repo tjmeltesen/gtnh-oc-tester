@@ -158,6 +158,34 @@ def build_parser() -> argparse.ArgumentParser:
         help="Host directory or script file to mount into OpenOS /home",
     )
     parser.add_argument(
+        "--resolution",
+        dest="resolution",
+        default="80x25",
+        help="Initial screen resolution WxH (default: 80x25; max Tier 3: 160x50)",
+    )
+    parser.add_argument(
+        "--scale",
+        dest="scale",
+        type=int,
+        default=2,
+        help="Pixel scale factor for --window mode (default: 2; auto-fits within monitor)",
+    )
+    parser.add_argument(
+        "--attach",
+        dest="attach",
+        action="append",
+        default=[],
+        help="Attach GTNH component(s), e.g. --attach me_controller --attach gt_machine",
+    )
+    parser.add_argument(
+        "-c",
+        "--command",
+        dest="command",
+        action="append",
+        default=[],
+        help="Initial shell command(s) to type on boot in interactive mode",
+    )
+    parser.add_argument(
         "--dag-dir",
         dest="dag_dir",
         default=None,
@@ -190,6 +218,9 @@ def main(argv: List[str] | None = None) -> int:
         os.environ["OC_CONFIG_PATH"] = str(args.oc_config)
 
     if args.interactive or args.web or args.terminal or ("shell" in args.targets):
+        from .interactive import _parse_resolution
+
+        res_w, res_h = _parse_resolution(args.resolution)
         env = _create_configured_env(
             jar_path=args.oc_jar,
             jar_version=args.jar_version,
@@ -199,12 +230,17 @@ def main(argv: List[str] | None = None) -> int:
             oc_config=args.oc_config,
             enforce_call_budget=not args.no_call_budget,
         )
+        env.screen.set_resolution(res_w, res_h)
+        for ctype in args.attach:
+            env.attach(ctype)
         mode = "web" if args.web else ("terminal" if args.terminal else ("window" if args.window else "auto"))
         return launch_interactive_session(
             env=env,
             mode=mode,
             mount_home=args.mount_home,
             web_port=args.port,
+            initial_commands=args.command,
+            scale=args.scale,
         )
 
     if not args.lua_only:

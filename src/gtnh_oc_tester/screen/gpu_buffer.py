@@ -134,6 +134,8 @@ class GPUScreenEmulator:
         self.bg_color: int = 0x000000
         self.bg_palette: Optional[int] = None
 
+        self.initial_width = int(width)
+        self.initial_height = int(height)
         self.pages: Dict[int, PageBuffer] = {
             0: PageBuffer(int(width), int(height))
         }

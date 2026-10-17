@@ -64,7 +64,7 @@ class _SandboxLuaAdapter:
 
 
 class OCLuaSandbox:
-    """Isolated OpenComputers Lua 5.3 / 5.2 runtime booting real `machine.lua` -> `bios.lua` -> OpenOS."""
+    """Isolated OpenComputers Lua 5.2 / 5.3 runtime booting real `machine.lua` -> `bios.lua` -> OpenOS."""
 
     def __init__(
         self,
@@ -72,17 +72,23 @@ class OCLuaSandbox:
         jar_loader: Optional[OCJarLoader] = None,
         component_bus: Optional[Any] = None,
         gpu_screen: Optional[Any] = None,
-        architecture: str = "Lua 5.3",
+        architecture: str = "Lua 5.2",
         ram_tier: int = 6,
         cpu_tier: int = 3,
         allow_bytecode: bool = False,
         allow_gc: bool = False,
         timeout: float = 5.0,
-        enforce_call_budget: bool = False,
+        enforce_call_budget: bool = True,
+        ram_scale_for_64bit: float = 1.8,
+        max_signal_queue_size: int = 1024,
+        raise_on_event_error: bool = False,
     ) -> None:
         self.host = host
         self.jar_loader = jar_loader or OCJarLoader()
-        self.scheduler = DeterministicScheduler()
+        self.scheduler = DeterministicScheduler(
+            max_signal_queue_size=max_signal_queue_size,
+            raise_on_event_error=raise_on_event_error,
+        )
         self.vfs = VirtualFileSystem(initial_files=self.jar_loader.list_openos_files())
         self.component_bus = component_bus
         self.gpu_screen = gpu_screen
@@ -106,10 +112,15 @@ class OCLuaSandbox:
             allow_gc=allow_gc,
             timeout=timeout,
             enforce_call_budget=enforce_call_budget,
+            ram_scale_for_64bit=ram_scale_for_64bit,
         )
         self.lua = _SandboxLuaAdapter(self.machine_host)
         self.machine_host.boot()
         self._install_fallbacks()
+
+    @property
+    def event_errors(self) -> List[str]:
+        return self.scheduler.event_errors
 
     @property
     def free_memory(self) -> int:
@@ -137,6 +148,8 @@ class OCLuaSandbox:
               -- Re-remove any host bridge symbols from sandbox _G
               _G.python = nil
               _G.__oc_bridge = nil
+              _G.__oc_record_result = nil
+              _G.__oc_comp_bridge = nil
               if _G.string then
                 _G.string.dump = nil
               end
@@ -149,7 +162,6 @@ class OCLuaSandbox:
 
     def bind_component_library(self, lua_component_lib: Any = None) -> None:
         """Keep the real OpenOS `component` library (`machine.lua` + `boot/04_component.lua`)."""
-        # Remove `__oc_comp_bridge` if `ComponentBus.build_lua_component_library` placed it in sandbox globals
         env = self.lua.globals()
         if env["__oc_comp_bridge"] is not None:
             env["__oc_comp_bridge"] = None

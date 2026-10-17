@@ -92,6 +92,10 @@ class AECraftingJobState:
     def cancel(self) -> bool:
         if not self.completed:
             self.canceled = True
+            if self.network is not None:
+                for cpu in self.network.cpus:
+                    if cpu.get("name") == self.cpu_name:
+                        cpu["busy"] = False
             return True
         return False
 
@@ -110,6 +114,121 @@ class AECraftingJobState:
             """
         )
         return factory(self)
+
+
+class AECpuProxy:
+    """Stateful GTNH 2.9 AE2 crafting CPU userdata (`getCpus()[i].cpu`)."""
+
+    def __init__(self, network: "MENetworkState", cpu_dict: Dict[str, Any]) -> None:
+        self.network = network
+        self.cpu_dict = cpu_dict
+
+    def _active_job(self) -> Optional[AECraftingJobState]:
+        cname = self.cpu_dict.get("name", "")
+        for job in reversed(self.network.active_jobs):
+            if (
+                job.cpu_name == cname
+                and not job.completed
+                and not job.canceled
+                and not job.failed
+            ):
+                return job
+        return None
+
+    def is_busy(self) -> bool:
+        if self._active_job() is not None:
+            return True
+        return bool(self.cpu_dict.get("busy", False))
+
+    def is_active(self) -> bool:
+        return self.is_busy() or bool(self.cpu_dict.get("active", True))
+
+    def get_storage(self) -> int:
+        return int(self.cpu_dict.get("storage", 65536))
+
+    def get_coprocessors(self) -> int:
+        return int(self.cpu_dict.get("coprocessors", 0))
+
+    def cancel(self) -> bool:
+        job = self._active_job()
+        self.cpu_dict["busy"] = False
+        if job is not None:
+            return job.cancel()
+        return True
+
+    def final_output(self, sandbox: Any = None) -> Any:
+        job = self._active_job()
+        if job is None:
+            return None
+        out = dict(job.item_or_fluid)
+        out["size"] = int(job.amount)
+        target_sb = sandbox or (self.network.bus.sandbox if self.network.bus else None)
+        return target_sb.python_to_lua(out) if target_sb else out
+
+    def active_items(self, sandbox: Any = None) -> Any:
+        job = self._active_job()
+        items: List[Dict[str, Any]] = []
+        if job is not None:
+            out = dict(job.item_or_fluid)
+            out["size"] = int(job.amount)
+            items.append(out)
+        target_sb = sandbox or (self.network.bus.sandbox if self.network.bus else None)
+        return target_sb.python_to_lua(items) if target_sb else items
+
+    def pending_items(self, sandbox: Any = None) -> Any:
+        job = self._active_job()
+        items: List[Dict[str, Any]] = []
+        if job is not None:
+            for rec in self.network.craftables:
+                if rec.output.get("name") == job.item_or_fluid.get("name"):
+                    for inp in rec.inputs:
+                        entry = dict(inp)
+                        entry["size"] = int(entry.get("size", 1)) * int(job.amount)
+                        items.append(entry)
+                    break
+        target_sb = sandbox or (self.network.bus.sandbox if self.network.bus else None)
+        return target_sb.python_to_lua(items) if target_sb else items
+
+    def stored_items(self, sandbox: Any = None) -> Any:
+        stored = list(self.cpu_dict.get("stored_items", []))
+        target_sb = sandbox or (self.network.bus.sandbox if self.network.bus else None)
+        return target_sb.python_to_lua(stored) if target_sb else stored
+
+    def __oc_lua_proxy__(self, sandbox: Any) -> Any:
+        factory = sandbox.lua.eval(
+            """
+            function(py_cpu, name, storage, coprocessors, sb)
+              local cpu = {
+                type = "userdata",
+                name = name,
+                storage = storage,
+                coprocessors = coprocessors,
+                busy = py_cpu.is_busy(),
+              }
+              function cpu.isBusy() return py_cpu.is_busy() end
+              function cpu.isActive() return py_cpu.is_active() end
+              function cpu.getStorage() return py_cpu.get_storage() end
+              function cpu. getCoprocessors() return py_cpu.get_coprocessors() end
+              function cpu.cancel()
+                local ok = py_cpu.cancel()
+                cpu.busy = py_cpu.is_busy()
+                return ok
+              end
+              function cpu.finalOutput() return py_cpu.final_output(sb) end
+              function cpu.activeItems() return py_cpu.active_items(sb) end
+              function cpu.pendingItems() return py_cpu.pending_items(sb) end
+              function cpu.storedItems() return py_cpu.stored_items(sb) end
+              return cpu
+            end
+            """.replace("cpu. getCoprocessors", "cpu.getCoprocessors")
+        )
+        return factory(
+            self,
+            str(self.cpu_dict.get("name", "")),
+            int(self.cpu_dict.get("storage", 65536)),
+            int(self.cpu_dict.get("coprocessors", 0)),
+            sandbox,
+        )
 
 
 @dataclass
@@ -565,16 +684,21 @@ class AE2NetworkComponent(SchemaBackedComponent):
         ]
 
     def _impl_getCpus(self) -> List[Dict[str, Any]]:
-        return [
-            {
-                "name": c["name"],
-                "storage": c["storage"],
-                "coprocessors": c["coprocessors"],
-                "busy": c["busy"],
-                "cpu": c,
-            }
-            for c in self.network.cpus
-        ]
+        out: List[Dict[str, Any]] = []
+        for c in self.network.cpus:
+            cpu_proxy = AECpuProxy(self.network, c)
+            is_busy = cpu_proxy.is_busy()
+            c["busy"] = is_busy
+            out.append(
+                {
+                    "name": c["name"],
+                    "storage": c["storage"],
+                    "coprocessors": c["coprocessors"],
+                    "busy": is_busy,
+                    "cpu": cpu_proxy,
+                }
+            )
+        return out
 
     def _impl_getCraftables(self, filter_tbl: Optional[Any] = None) -> List[Any]:
         flt = _lua_to_py(filter_tbl, self.bus) if filter_tbl is not None else None

@@ -13,6 +13,7 @@ import pytest
 from rich.console import Console
 from rich.table import Table
 
+from .interactive import launch_interactive_session
 from .lua_runner import LuaSpecRunner, LuaTestResult
 from .pytest_plugin import RAM_TIER_KB, _create_configured_env
 from .screen.window import OCPygameWindow
@@ -43,6 +44,7 @@ def _build_lua_runner(args: argparse.Namespace) -> LuaSpecRunner:
         "ram_tier": args.ram_tier,
         "oc_config": args.oc_config,
         "config_path": args.oc_config,
+        "enforce_call_budget": not getattr(args, "no_call_budget", False),
     }
     filtered = {
         k: v
@@ -79,9 +81,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--lua-version",
         dest="lua_version",
-        default="5.3",
+        default="5.2",
         choices=["5.2", "5.3"],
-        help="Select CPU Lua architecture (5.3 or 5.2, default: 5.3)",
+        help="Select CPU Lua architecture (5.2 or 5.3, default: 5.2)",
     )
     parser.add_argument(
         "--cpu-tier",
@@ -106,11 +108,54 @@ def build_parser() -> argparse.ArgumentParser:
         help="Path to custom OpenComputers.cfg file",
     )
     parser.add_argument(
+        "--no-call-budget",
+        dest="no_call_budget",
+        action="store_true",
+        default=False,
+        help="Disable per-tick component call budget enforcement",
+    )
+    parser.add_argument(
         "--window",
         dest="window",
         action="store_true",
         default=False,
         help="Open the interactive Pygame OpenComputers screen window",
+    )
+    parser.add_argument(
+        "--interactive",
+        "-i",
+        dest="interactive",
+        action="store_true",
+        default=False,
+        help="Boot OpenOS into a live interactive `/bin/sh.lua` screen & shell",
+    )
+    parser.add_argument(
+        "--web",
+        dest="web",
+        action="store_true",
+        default=False,
+        help="Launch interactive Browser Web UI at http://127.0.0.1:<port>",
+    )
+    parser.add_argument(
+        "--terminal",
+        "--tui",
+        dest="terminal",
+        action="store_true",
+        default=False,
+        help="Launch interactive ANSI TUI in the terminal",
+    )
+    parser.add_argument(
+        "--port",
+        dest="port",
+        type=int,
+        default=8080,
+        help="Port for --web mode (default: 8080)",
+    )
+    parser.add_argument(
+        "--mount-home",
+        dest="mount_home",
+        default=None,
+        help="Host directory or script file to mount into OpenOS /home",
     )
     parser.add_argument(
         "--dag-dir",
@@ -144,6 +189,24 @@ def main(argv: List[str] | None = None) -> int:
     if args.oc_config:
         os.environ["OC_CONFIG_PATH"] = str(args.oc_config)
 
+    if args.interactive or args.web or args.terminal or ("shell" in args.targets):
+        env = _create_configured_env(
+            jar_path=args.oc_jar,
+            jar_version=args.jar_version,
+            lua_version=args.lua_version,
+            cpu_tier=args.cpu_tier,
+            ram_tier=args.ram_tier,
+            oc_config=args.oc_config,
+            enforce_call_budget=not args.no_call_budget,
+        )
+        mode = "web" if args.web else ("terminal" if args.terminal else ("window" if args.window else "auto"))
+        return launch_interactive_session(
+            env=env,
+            mode=mode,
+            mount_home=args.mount_home,
+            web_port=args.port,
+        )
+
     if not args.lua_only:
         py_targets = [t for t in args.targets if not t.endswith(".lua")]
         pytest_args: List[str] = []
@@ -165,6 +228,8 @@ def main(argv: List[str] | None = None) -> int:
                 pytest_args.extend(["--oc-ram-tier", str(args.ram_tier)])
             if args.oc_config:
                 pytest_args.extend(["--oc-config", str(args.oc_config)])
+            if args.no_call_budget:
+                pytest_args.append("--oc-no-call-budget")
             if args.window:
                 pytest_args.append("--oc-window")
             if args.dag_dir:
@@ -219,6 +284,7 @@ def main(argv: List[str] | None = None) -> int:
                 cpu_tier=args.cpu_tier,
                 ram_tier=args.ram_tier,
                 oc_config=args.oc_config,
+                enforce_call_budget=not args.no_call_budget,
             )
             env.run_file(script_path)
             if args.window:

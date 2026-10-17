@@ -2,6 +2,7 @@
 
 from .components import (
     AE2NetworkComponent,
+    AECpuProxy,
     AECraftableRecipe,
     AECraftingJobState,
     ComponentBus,
@@ -27,6 +28,7 @@ from .components import (
 )
 from .dag import DAGNode, ExecutionDAG, ExecutionTracer, TraceEvent
 from .environment import OCEnvironment
+from .interactive import OCInteractiveWebServer, launch_interactive_session, main_shell
 from .lua_runner import LuaSpecRunner, LuaTestResult
 from .runtime import (
     ALL_28_OPENOS_LIBS,
@@ -50,6 +52,7 @@ __version__ = "0.2.0"
 
 __all__ = [
     "AE2NetworkComponent",
+    "AECpuProxy",
     "AECraftableRecipe",
     "AECraftingJobState",
     "ALL_28_OPENOS_LIBS",
@@ -76,6 +79,7 @@ __all__ = [
     "MENetworkState",
     "ModemComponent",
     "OCEnvironment",
+    "OCInteractiveWebServer",
     "OCJarLoader",
     "OCLuaSandbox",
     "OCMachineConfig",
@@ -91,6 +95,8 @@ __all__ = [
     "VirtualFileSystem",
     "WorldInventoryGrid",
     "get_default_registry",
+    "launch_interactive_session",
     "load_oc_config",
+    "main_shell",
     "validate_simulator_dumps",
 ]

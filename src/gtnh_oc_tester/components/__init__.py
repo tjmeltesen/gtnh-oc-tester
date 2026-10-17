@@ -17,6 +17,7 @@ from .oc_components import (
 )
 from .simulators import (
     AE2NetworkComponent,
+    AECpuProxy,
     AECraftableRecipe,
     AECraftingJobState,
     DatabaseSimulator,
@@ -31,6 +32,7 @@ from .simulators import (
 
 __all__ = [
     "AE2NetworkComponent",
+    "AECpuProxy",
     "AECraftableRecipe",
     "AECraftingJobState",
     "ComponentBus",

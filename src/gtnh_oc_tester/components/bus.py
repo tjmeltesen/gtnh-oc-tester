@@ -98,12 +98,6 @@ INDIRECT_METHODS_BY_TYPE: Dict[str, set[str]] = {
         "drain",
         "fill",
     },
-    "filesystem": {
-        "makeDirectory",
-        "remove",
-        "rename",
-        "setLabel",
-    },
     "eeprom": {
         "set",
         "setData",
@@ -133,6 +127,10 @@ DIRECT_CALL_LIMITS: Dict[Tuple[str, str], float] = {
     ("filesystem", "size"): 20.0,
     ("filesystem", "lastModified"): 20.0,
     ("filesystem", "list"): 5.0,
+    ("filesystem", "makeDirectory"): 15.0,
+    ("filesystem", "remove"): 15.0,
+    ("filesystem", "rename"): 15.0,
+    ("filesystem", "setLabel"): 5.0,
 }
 
 
@@ -147,7 +145,7 @@ class ComponentBus:
         sandbox: Optional[Any] = None,
         config: Optional[OCMachineConfig] = None,
         call_budget_limit: Optional[float] = None,
-        enforce_call_budget: bool = False,
+        enforce_call_budget: bool = True,
         vfs: Optional[Any] = None,
     ) -> None:
         self.host = host
@@ -508,9 +506,10 @@ class ComponentBus:
 
             method_names = sandbox.python_to_lua(sorted(comp.get_exposed_methods()))
             extra_fields = sandbox.python_to_lua(comp.extra_fields)
+            doc_fn = lambda a, m: comp.get_doc(str(m))
             proxy_builder = sandbox.lua.eval(
                 r"""
-                function(addr, ctype, cslot, methods_list, extra_tbl, invoke_fn)
+                function(addr, ctype, cslot, methods_list, extra_tbl, invoke_fn, doc_fn)
                   local p = {
                     address = addr,
                     type = ctype,
@@ -533,7 +532,7 @@ class ComponentBus:
                         return table.unpack(packed, 2, packed.n or #packed)
                       end,
                       __tostring = function()
-                        return __oc_comp_bridge.doc(addr, mname) or ("function()")
+                        return doc_fn(addr, mname) or ("function()")
                       end
                     })
                     p[mname] = fn_table
@@ -549,6 +548,7 @@ class ComponentBus:
                 method_names,
                 extra_fields,
                 _invoke_packed,
+                doc_fn,
             )
             proxy_cache[comp.address] = proxy
             return proxy
@@ -609,16 +609,16 @@ class ComponentBus:
                     return True
                 return False
 
-        sandbox.lua.globals()["__oc_comp_bridge"] = _CompBridge()
-        comp_lib = sandbox.lua.eval(
+        bridge = _CompBridge()
+        comp_lib_factory = sandbox.lua.eval(
             r"""
-            (function()
+            function(bridge)
               local comp = {}
               function comp.list(filter, exact)
                 if filter ~= nil and exact == nil then
                   exact = false
                 end
-                local tbl = __oc_comp_bridge.list_entries(filter, exact)
+                local tbl = bridge.list_entries(filter, exact)
                 local keys = {}
                 for k in pairs(tbl) do
                   table.insert(keys, k)
@@ -638,52 +638,52 @@ class ComponentBus:
               end
               function comp.proxy(address)
                 checkArg(1, address, "string")
-                local p = __oc_comp_bridge.proxy(address)
+                local p = bridge.proxy(address)
                 if not p then return nil, "no such component" end
                 return p
               end
               function comp.invoke(address, method, ...)
                 checkArg(1, address, "string")
                 checkArg(2, method, "string")
-                local packed = __oc_comp_bridge.invoke(address, method, ...)
+                local packed = bridge.invoke(address, method, ...)
                 return table.unpack(packed, 2, packed.n or #packed)
               end
               function comp.doc(address, method)
                 checkArg(1, address, "string")
                 checkArg(2, method, "string")
-                return __oc_comp_bridge.doc(address, method)
+                return bridge.doc(address, method)
               end
               function comp.methods(address)
                 checkArg(1, address, "string")
-                return __oc_comp_bridge.methods(address)
+                return bridge.methods(address)
               end
               function comp.type(address)
                 checkArg(1, address, "string")
-                return __oc_comp_bridge.ctype(address)
+                return bridge.ctype(address)
               end
               function comp.slot(address)
                 checkArg(1, address, "string")
-                return __oc_comp_bridge.slot(address)
+                return bridge.slot(address)
               end
               function comp.get(address, componentType)
                 checkArg(1, address, "string")
                 checkArg(2, componentType, "string", "nil")
-                local full = __oc_comp_bridge.get_addr(address, componentType)
+                local full = bridge.get_addr(address, componentType)
                 if not full then return nil, "no such component" end
                 return full
               end
               function comp.isAvailable(componentType)
                 checkArg(1, componentType, "string")
-                return __oc_comp_bridge.is_available(componentType)
+                return bridge.is_available(componentType)
               end
               function comp.getPrimary(componentType)
                 checkArg(1, componentType, "string")
-                return __oc_comp_bridge.get_primary(componentType)
+                return bridge.get_primary(componentType)
               end
               function comp.setPrimary(componentType, address)
                 checkArg(1, componentType, "string")
                 checkArg(2, address, "string")
-                return __oc_comp_bridge.set_primary(componentType, address)
+                return bridge.set_primary(componentType, address)
               end
               setmetatable(comp, {
                 __index = function(_, key)
@@ -694,8 +694,9 @@ class ComponentBus:
                 end
               })
               return comp
-            end)()
+            end
             """
         )
+        comp_lib = comp_lib_factory(bridge)
         sandbox.bind_component_library(comp_lib)
         return comp_lib

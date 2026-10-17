@@ -21,11 +21,25 @@ from gtnh_oc_tester import (
 
 
 # -----------------------------------------------------------------------------
-# WP1: Pin Lua Version (Lua 5.3 default, Lua 5.2 selectable, no Lua 5.4)
+# WP1: Pin Lua Version (Lua 5.2 default per GTNH config, Lua 5.3 selectable, no Lua 5.4)
 # -----------------------------------------------------------------------------
 
 
 def test_wp1_lua53_default_and_lua52_selectable() -> None:
+    # Default OCEnvironment() must use Lua 5.2 per GTNH OpenComputers.cfg (defaultLua53=false)
+    env_default = OCEnvironment()
+    assert env_default.lua_version == "5.2"
+    assert env_default.config.architecture == "Lua 5.2"
+    ver_def = env_default.run_lua("return _VERSION, require('computer').getArchitecture(), bit32.band(0xFF, 0x0F)")
+    assert ver_def[0] == "Lua 5.2"
+    assert ver_def[1] == "Lua 5.2"
+    assert ver_def[2] == 15
+
+    # In Lua 5.2, native `<<` bitwise shift operator is a syntax error
+    res_shift = env_default.run_lua('local fn, err = load("return 1 << 4"); return fn == nil')
+    assert res_shift is True
+
+    # Verify Lua 5.3 is selectable and supports native 5.3 bitwise operators
     env53 = OCEnvironment(lua_version="5.3")
     ver53 = env53.run_lua("return _VERSION, (1 << 4), (64 >> 2), (7 // 2), (0x0F & 0x33)")
     assert ver53[0] == "Lua 5.3"
@@ -38,20 +52,9 @@ def test_wp1_lua53_default_and_lua52_selectable() -> None:
     res_const = env53.run_lua('local fn, err = load("local x <const> = 1"); return fn == nil')
     assert res_const is True
 
-    # Verify Lua 5.2 is selectable and reports _VERSION == "Lua 5.2"
-    env52 = OCEnvironment(lua_version="5.2")
-    ver52 = env52.run_lua("return _VERSION, require('computer').getArchitecture(), bit32.band(0xFF, 0x0F)")
-    assert ver52[0] == "Lua 5.2"
-    assert ver52[1] == "Lua 5.2"
-    assert ver52[2] == 15
-
-    # In Lua 5.2, native `<<` bitwise shift operator is a syntax error
-    res_shift = env52.run_lua('local fn, err = load("return 1 << 4"); return fn == nil')
-    assert res_shift is True
-
 
 # -----------------------------------------------------------------------------
-# WP2: Close Sandbox Security Hole (No host shell, no python, no bytecode, etc.)
+# WP2: Close Sandbox Security Hole (No host shell, no python, no __oc_record_result, strict attribute_filter)
 # -----------------------------------------------------------------------------
 
 
@@ -61,9 +64,13 @@ def test_wp2_sandbox_security_isolation(tmp_path: Path) -> None:
 
     res = env.run_lua(
         f"""
-        -- 1. python and __oc_bridge must be nil
+        -- 1. python, __oc_bridge, __oc_record_result, __oc_comp_bridge must all be nil in _G and _ENV
         assert(_G.python == nil, "_G.python leaked into sandbox")
         assert(_G.__oc_bridge == nil, "_G.__oc_bridge leaked into sandbox")
+        assert(_G.__oc_record_result == nil, "_G.__oc_record_result leaked into sandbox")
+        assert(_ENV.__oc_record_result == nil, "_ENV.__oc_record_result leaked into sandbox")
+        assert(_G.__oc_comp_bridge == nil, "_G.__oc_comp_bridge leaked into sandbox")
+        assert(require("computer").__oc_take_host_hooks == nil, "__oc_take_host_hooks leaked")
 
         -- 2. io.popen and string.dump must be nil
         assert(io.popen == nil, "io.popen must be nil")
@@ -99,6 +106,29 @@ def test_wp2_sandbox_security_isolation(tmp_path: Path) -> None:
     )
     assert res is True
     assert not sentinel.exists(), "os.execute executed on the host shell!"
+
+    # 7. Verify strict Lupa attribute_filter blocks dunder/private attribute access on any Python callable/object
+    raw_lua = env.sandbox.machine_host.lua
+    probe = raw_lua.eval(
+        """
+        function(py_cb, py_obj)
+          local ok1 = pcall(function() return py_cb.__globals__ end)
+          local ok2 = pcall(function() return py_cb.__class__ end)
+          local ok3 = pcall(function() return py_cb.__builtins__ end)
+          local ok4 = pcall(function() return py_obj.__class__ end)
+          local ok5 = pcall(function() return py_obj._secret end)
+          local ok6 = pcall(function() py_obj.public_attr = 99 end)
+          return ok1, ok2, ok3, ok4, ok5, ok6
+        end
+        """
+    )
+
+    class _DummyBridge:
+        _secret = "top_secret"
+        public_attr = 1
+
+    ok1, ok2, ok3, ok4, ok5, ok6 = probe(lambda: 123, _DummyBridge())
+    assert (ok1, ok2, ok3, ok4, ok5, ok6) == (False, False, False, False, False, False)
 
 
 # -----------------------------------------------------------------------------
@@ -178,15 +208,38 @@ def test_wp4_signal_yielding_timers_and_deadlock() -> None:
 
 
 def test_wp5_too_long_without_yielding_timeout() -> None:
-    env = OCEnvironment()
+    import time
+
+    # 1. A legitimate game-valid heavy pure-Lua loop (~0.15s-0.3s wall-clock, >2,000,000 iterations)
+    # must SUCCEED under the 5.0s timeout without prematurely firing "too long without yielding".
+    env_ok = OCEnvironment()
+    assert env_ok.config.timeout == 5.0
+    total = env_ok.run_lua(
+        """
+        local acc = 0
+        for i = 1, 2500000 do
+          acc = acc + i
+        end
+        return acc
+        """
+    )
+    assert total == 2500000 * 2500001 // 2
+
+    # 2. A genuine infinite loop exceeding `timeout` wall-clock seconds must fail with "too long without yielding".
+    env_timeout = OCEnvironment(timeout=0.35)
+    t0 = time.perf_counter()
     with pytest.raises(RuntimeError, match="too long without yielding"):
-        env.run_lua("while true do end")
+        env_timeout.run_lua("while true do end")
+    elapsed = time.perf_counter() - t0
+    assert elapsed >= 0.30, f"Timeout fired too early ({elapsed:.3f}s < 0.30s)"
 
 
 def test_wp5_cpu_tier_call_budgets() -> None:
-    # Tier 1 CPU has 0.5 call budget per tick; Tier 3 CPU has 1.5 call budget per tick
-    env_t1 = OCEnvironment(cpu_tier=1, enforce_call_budget=True)
-    env_t3 = OCEnvironment(cpu_tier=3, enforce_call_budget=True)
+    # Call budget enforcement is enabled by default
+    env_t1 = OCEnvironment(cpu_tier=1)
+    env_t3 = OCEnvironment(cpu_tier=3)
+    assert env_t1.enforce_call_budget is True
+    assert env_t3.enforce_call_budget is True
     assert env_t1.config.call_budget_per_tick == 0.5
     assert env_t3.config.call_budget_per_tick == 1.5
 
@@ -226,6 +279,11 @@ def test_wp5_cpu_tier_call_budgets() -> None:
 def test_wp5_ram_tier_memory_cap_oom() -> None:
     env_t1 = OCEnvironment(ram_tier=1)
     assert env_t1.sandbox.total_memory == 192 * 1024
+    # OpenOS kernel & boot libraries must be counted against the 192 KB RAM limit
+    free_after_boot = env_t1.run_lua("return require('computer').freeMemory()")
+    assert 8 * 1024 <= free_after_boot <= 115 * 1024, (
+        f"Expected OpenOS boot to consume ~80-150KB of T1 192KB RAM, got free={free_after_boot}"
+    )
 
     with pytest.raises(Exception, match="not enough memory|MemoryError"):
         env_t1.run_lua(
@@ -238,7 +296,7 @@ def test_wp5_ram_tier_memory_cap_oom() -> None:
         )
 
 
-def test_wp5_signal_queue_cap_1024() -> None:
+def test_wp5_signal_queue_cap_1024(tmp_path: Path) -> None:
     env = OCEnvironment()
     assert env.scheduler.max_signal_queue_size == 1024
 
@@ -247,6 +305,15 @@ def test_wp5_signal_queue_cap_1024() -> None:
     # 1025th signal must be dropped and return False
     assert env.push_event("test_sig", 1025) is False
     env.scheduler.signal_queue.clear()
+
+    # Also verify custom maxSignalQueueSize (e.g. 256 from RC-1 / custom config) is honored
+    custom_cfg = tmp_path / "OpenComputers_256.cfg"
+    custom_cfg.write_text("opencomputers {\n  computer {\n    maxSignalQueueSize=256\n  }\n}\n", encoding="utf-8")
+    env256 = OCEnvironment(oc_config=custom_cfg)
+    assert env256.scheduler.max_signal_queue_size == 256
+    for i in range(256):
+        assert env256.push_event("sig256", i) is True
+    assert env256.push_event("sig256", 257) is False
 
 
 def test_wp5_eeprom_size_limits_4096_and_256() -> None:
@@ -464,3 +531,169 @@ def test_wp10_pygame_window_rendering_and_input_signals() -> None:
         assert signals[5][0] == "scroll" and signals[5][2:5] == (4, 3, 1)
     finally:
         win.close()
+
+
+# -----------------------------------------------------------------------------
+# Additional Review Verifications: Event Error Surfacing, LSC & AE2 CPU State,
+# Golden GTNH 2.9 Dump Comparison, and Live Interactive OpenOS Shell
+# -----------------------------------------------------------------------------
+
+
+def test_event_timer_and_listener_error_surfacing() -> None:
+    env = OCEnvironment()
+    env.run_lua(
+        r"""
+        local event = require("event")
+        event.timer(0.05, function()
+          error("timer_callback_boom_123")
+        end, 1)
+        event.listen("custom_bad_sig", function()
+          error("listener_callback_boom_456")
+        end)
+        event.push("custom_bad_sig")
+        os.sleep(0.1)
+        """
+    )
+    assert len(env.event_errors) >= 2
+    assert any("timer_callback_boom_123" in e for e in env.event_errors)
+    assert any("listener_callback_boom_456" in e for e in env.event_errors)
+    log_text = env.read_event_log()
+    assert "timer_callback_boom_123" in log_text
+    assert "listener_callback_boom_456" in log_text
+
+
+def test_stateful_lsc_multiblock_and_ae2_cpu_cluster() -> None:
+    env = OCEnvironment()
+    lsc = env.attach_gt_machine(
+        "gt_machine",
+        address="lsc-0001",
+        machine_name="gt.blockmachines.multimachine.supercapacitor",
+        stored_eu=50_000_000,
+        eu_capacity=100_000_000,
+        eu_input_avg=20_000.0,
+        eu_output_avg=5_000.0,
+        passive_loss_per_tick=1_000,
+        wireless_mode=True,
+        wireless_eu=1_000_000,
+    )
+    me = env.attach_me_network("me_controller", address="me-0001")
+    me.network.add_craftable(
+        "gregtech:gt.metaitem.01:32705",
+        label="Quantumprocessor",
+        duration_ticks=10,
+        inputs=[{"name": "minecraft:redstone", "size": 4}],
+    )
+
+    res = env.run_lua(
+        r"""
+        local component = require("component")
+        local lsc = component.gt_machine
+        local me = component.me_controller
+
+        local eu0 = lsc.getEUStored()
+        local info0 = lsc.getSensorInformation()
+        os.sleep(0.25) -- 5 ticks: net +14,000 EU/tick -> +70,000 EU
+        local eu1 = lsc.getEUStored()
+        local info1 = lsc.getSensorInformation()
+
+        local craftables = me.getCraftables({label = "Quantumprocessor"})
+        assert(#craftables == 1)
+        local job = craftables[1].request(2, true, "CPU-1")
+
+        local cpus_busy = me.getCpus()
+        local cpu1 = cpus_busy[1].cpu
+        local was_busy = cpu1.isBusy()
+        local final_out = cpu1.finalOutput()
+        local active_list = cpu1.activeItems()
+        local pending_list = cpu1.pendingItems()
+        cpu1.cancel()
+        local busy_after_cancel = cpu1.isBusy()
+
+        return eu0, eu1, info0[2], info1[2], was_busy, final_out.label, final_out.size, #active_list, #pending_list, busy_after_cancel, job.isCanceled()
+        """
+    )
+    assert res[0] == 50_000_000
+    assert res[1] > res[0]
+    assert "50,000,000" in res[2]
+    assert res[3] != res[2]
+    assert res[4] is True
+    assert res[5] == "Quantumprocessor"
+    assert res[6] == 2
+    assert res[7] == 1
+    assert res[8] == 1
+    assert res[9] is False
+    assert res[10] is True
+
+
+def test_golden_gtnh29_proxy_dump_comparison() -> None:
+    """Compare simulated component proxy methods and docstrings directly against GTNH 2.9 dump files."""
+    env = OCEnvironment(enforce_call_budget=False)
+    env.attach_me_network("me_controller", address="golden-me")
+    env.attach_gt_machine("gt_machine", address="golden-gt")
+    env.attach_transposer(address="golden-tp")
+    env.attach_redstone(address="golden-rs")
+
+    for ctype, addr in (
+        ("me_controller", "golden-me"),
+        ("gt_machine", "golden-gt"),
+        ("transposer", "golden-tp"),
+        ("redstone", "golden-rs"),
+    ):
+        schema = env.registry.get_component_schema(ctype, host="computer")
+        assert schema is not None
+        lua_methods = env.run_lua(f'return require("component").methods("{addr}")')
+        for mname, dspec in schema.dump_methods.items():
+            assert mname in lua_methods, f"{ctype} missing dump method {mname}"
+            doc = env.run_lua(f'return require("component").doc("{addr}", "{mname}")')
+            if dspec.raw_doc:
+                assert doc == dspec.raw_doc
+
+
+def test_interactive_openos_shell_and_web_server(tmp_path: Path) -> None:
+    """Verify live interactive OpenOS `/bin/sh.lua` screen typing, script execution, and Web UI server."""
+    import json
+    from urllib.request import Request, urlopen
+    from gtnh_oc_tester import OCInteractiveWebServer
+
+    scripts_dir = tmp_path / "user_scripts"
+    scripts_dir.mkdir()
+    (scripts_dir / "hello_gtnh.lua").write_text(
+        'print("SCRIPT_OK_" .. tostring(6 * 7))\n',
+        encoding="utf-8",
+    )
+
+    env = OCEnvironment()
+    env.start_interactive_shell(mount_home=scripts_dir)
+
+    # Initial prompt should be rendered on the OpenComputers screen
+    initial_screen = env.screen.to_text()
+    assert "/home" in initial_screen or "#" in initial_screen
+
+    # Type a shell command interactively and verify its output on the GPU screen
+    screen_after_echo = env.send_text("echo LIVE_SHELL_TEST_42", press_enter=True, step_ticks=15)
+    assert "LIVE_SHELL_TEST_42" in screen_after_echo
+
+    # Run the mounted Lua script from /home interactively via the shell prompt
+    screen_after_script = env.send_text("/home/hello_gtnh.lua", press_enter=True, step_ticks=20)
+    assert "SCRIPT_OK_42" in screen_after_script
+
+    # Also verify the built-in interactive HTTP Web UI server
+    srv = OCInteractiveWebServer(env, host="127.0.0.1", port=0)
+    url = srv.start_background()
+    try:
+        with urlopen(f"{url}/api/state", timeout=5) as resp:
+            state = json.loads(resp.read().decode("utf-8"))
+        assert "SCRIPT_OK_42" in state["screen_text"]
+
+        req = Request(
+            f"{url}/api/input",
+            data=json.dumps({"action": "text", "text": "echo WEB_CMD_99", "press_enter": True}).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urlopen(req, timeout=5) as resp:
+            updated = json.loads(resp.read().decode("utf-8"))
+        assert "WEB_CMD_99" in updated["screen_text"]
+    finally:
+        srv.stop()
+

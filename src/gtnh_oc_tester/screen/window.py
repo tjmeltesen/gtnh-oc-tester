@@ -7,7 +7,10 @@ from pathlib import Path
 import sys
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
-import pygame
+try:
+    import pygame
+except ImportError:  # pragma: no cover - optional [window] extra
+    pygame = None  # type: ignore[assignment]
 
 from ..specs.jar_loader import OCJarLoader
 from .gpu_buffer import DEFAULT_PALETTE, GPUScreenEmulator, ScreenCell
@@ -16,6 +19,8 @@ from .renderers import FontHexRenderer
 
 def _build_pygame_to_oc_keycode() -> Dict[int, int]:
     """Build complete mapping of Pygame `K_*` constants to OpenComputers / LWJGL2 key codes."""
+    if pygame is None:
+        return {}
     mapping: Dict[int, int] = {
         pygame.K_ESCAPE: 0x01,
         pygame.K_1: 0x02,
@@ -147,39 +152,47 @@ def _build_pygame_to_oc_keycode() -> Dict[int, int]:
 
 PYGAME_TO_OC_KEYCODE: Dict[int, int] = _build_pygame_to_oc_keycode()
 
-_SHIFTED_ASCII: Dict[int, str] = {
-    pygame.K_1: "!",
-    pygame.K_2: "@",
-    pygame.K_3: "#",
-    pygame.K_4: "$",
-    pygame.K_5: "%",
-    pygame.K_6: "^",
-    pygame.K_7: "&",
-    pygame.K_8: "*",
-    pygame.K_9: "(",
-    pygame.K_0: ")",
-    pygame.K_MINUS: "_",
-    pygame.K_EQUALS: "+",
-    pygame.K_LEFTBRACKET: "{",
-    pygame.K_RIGHTBRACKET: "}",
-    pygame.K_BACKSLASH: "|",
-    pygame.K_SEMICOLON: ":",
-    pygame.K_QUOTE: '"',
-    pygame.K_BACKQUOTE: "~",
-    pygame.K_COMMA: "<",
-    pygame.K_PERIOD: ">",
-    pygame.K_SLASH: "?",
-}
+_SHIFTED_ASCII: Dict[int, str] = (
+    {
+        pygame.K_1: "!",
+        pygame.K_2: "@",
+        pygame.K_3: "#",
+        pygame.K_4: "$",
+        pygame.K_5: "%",
+        pygame.K_6: "^",
+        pygame.K_7: "&",
+        pygame.K_8: "*",
+        pygame.K_9: "(",
+        pygame.K_0: ")",
+        pygame.K_MINUS: "_",
+        pygame.K_EQUALS: "+",
+        pygame.K_LEFTBRACKET: "{",
+        pygame.K_RIGHTBRACKET: "}",
+        pygame.K_BACKSLASH: "|",
+        pygame.K_SEMICOLON: ":",
+        pygame.K_QUOTE: '"',
+        pygame.K_BACKQUOTE: "~",
+        pygame.K_COMMA: "<",
+        pygame.K_PERIOD: ">",
+        pygame.K_SLASH: "?",
+    }
+    if pygame is not None
+    else {}
+)
 
-_CONTROL_CHAR_CODES: Dict[int, int] = {
-    pygame.K_RETURN: 13,
-    pygame.K_KP_ENTER: 13,
-    pygame.K_BACKSPACE: 8,
-    pygame.K_TAB: 9,
-    pygame.K_ESCAPE: 27,
-    pygame.K_DELETE: 127,
-    pygame.K_SPACE: 32,
-}
+_CONTROL_CHAR_CODES: Dict[int, int] = (
+    {
+        pygame.K_RETURN: 13,
+        pygame.K_KP_ENTER: 13,
+        pygame.K_BACKSPACE: 8,
+        pygame.K_TAB: 9,
+        pygame.K_ESCAPE: 27,
+        pygame.K_DELETE: 127,
+        pygame.K_SPACE: 32,
+    }
+    if pygame is not None
+    else {}
+)
 
 
 def _build_oc_240_fixed_palette() -> Tuple[int, ...]:
@@ -291,6 +304,10 @@ class OCPygameWindow:
             os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
             os.environ.setdefault("SDL_AUDIODRIVER", "dummy")
 
+        if pygame is None:
+            raise ImportError(
+                "pygame is required for OCPygameWindow; install with `pip install 'gtnh-oc-tester[window]'`"
+            )
         if not pygame.get_init():
             pygame.init()
         if not pygame.display.get_init():
@@ -630,6 +647,13 @@ class OCPygameWindow:
             if step_callback is not None:
                 res = step_callback()
                 if res is False:
+                    break
+            elif (
+                self.env is not None
+                and hasattr(self.env, "step_interactive_tick")
+                and getattr(getattr(getattr(self.env, "sandbox", None), "machine_host", None), "_interactive_mode", False)
+            ):
+                if not self.env.step_interactive_tick():
                     break
             elif self.env is not None and hasattr(self.env, "advance_ticks"):
                 self.env.advance_ticks(1)

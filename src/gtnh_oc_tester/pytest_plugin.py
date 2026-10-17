@@ -40,9 +40,9 @@ def pytest_addoption(parser: pytest.Parser) -> None:
     group.addoption(
         "--oc-lua-version",
         action="store",
-        default="5.3",
+        default="5.2",
         choices=["5.2", "5.3", "Lua 5.2", "Lua 5.3"],
-        help="CPU Lua architecture version (5.3 or 5.2, default 5.3)",
+        help="CPU Lua architecture version (5.2 or 5.3, default 5.2)",
     )
     group.addoption(
         "--oc-cpu-tier",
@@ -67,6 +67,12 @@ def pytest_addoption(parser: pytest.Parser) -> None:
         help="Path to custom OpenComputers.cfg file",
     )
     group.addoption(
+        "--oc-no-call-budget",
+        action="store_true",
+        default=False,
+        help="Disable per-tick component call budget enforcement",
+    )
+    group.addoption(
         "--oc-window",
         action="store_true",
         default=False,
@@ -84,10 +90,11 @@ def _create_configured_env(
     *,
     jar_path: Any = None,
     jar_version: str = "1.12.64-GTNH",
-    lua_version: str = "5.3",
+    lua_version: str = "5.2",
     cpu_tier: int = 3,
     ram_tier: int = 6,
     oc_config: Any = None,
+    enforce_call_budget: bool = True,
 ) -> OCEnvironment:
     sig = inspect.signature(OCEnvironment.__init__)
     params = sig.parameters
@@ -101,6 +108,7 @@ def _create_configured_env(
         "ram_tier": int(ram_tier),
         "oc_config": oc_config,
         "config_path": oc_config,
+        "enforce_call_budget": bool(enforce_call_budget),
     }
     filtered_kwargs = {
         k: v
@@ -137,10 +145,11 @@ def oc_env(request: pytest.FixtureRequest) -> Generator[OCEnvironment, None, Non
     """Provide an isolated GTNH 2.9 OpenComputers simulation environment for each test."""
     jar_path = request.config.getoption("--oc-jar")
     jar_version = request.config.getoption("--oc-jar-version") or os.environ.get("OC_JAR_VERSION", "1.12.64-GTNH")
-    lua_version = request.config.getoption("--oc-lua-version") or os.environ.get("OC_LUA_VERSION", "5.3")
+    lua_version = request.config.getoption("--oc-lua-version") or os.environ.get("OC_LUA_VERSION", "5.2")
     cpu_tier = request.config.getoption("--oc-cpu-tier") or int(os.environ.get("OC_CPU_TIER", "3"))
     ram_tier = request.config.getoption("--oc-ram-tier") or int(os.environ.get("OC_RAM_TIER", "6"))
     oc_config = request.config.getoption("--oc-config") or os.environ.get("OC_CONFIG_PATH")
+    no_call_budget = bool(request.config.getoption("--oc-no-call-budget"))
     use_window = bool(request.config.getoption("--oc-window"))
 
     env = _create_configured_env(
@@ -150,6 +159,7 @@ def oc_env(request: pytest.FixtureRequest) -> Generator[OCEnvironment, None, Non
         cpu_tier=int(cpu_tier),
         ram_tier=int(ram_tier),
         oc_config=oc_config,
+        enforce_call_budget=not no_call_budget,
     )
 
     window: OCPygameWindow | None = None

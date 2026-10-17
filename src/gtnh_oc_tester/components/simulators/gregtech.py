@@ -26,6 +26,15 @@ class GTMachineSimulator(SchemaBackedComponent):
         has_work: bool = False,
         work_progress: int = 0,
         work_max_progress: int = 200,
+        eu_input_avg: float = 2048.0,
+        eu_output_avg: float = 0.0,
+        passive_loss_per_tick: int = 0,
+        recipe_eu_per_tick: int = 0,
+        maintenance_problems: int = 0,
+        efficiency: float = 100.0,
+        wireless_mode: bool = False,
+        wireless_eu: int = 0,
+        simulate_eu_dynamics: bool = False,
     ) -> None:
         super().__init__(
             component_type=component_type,
@@ -41,8 +50,16 @@ class GTMachineSimulator(SchemaBackedComponent):
         self.coordinates = (0, 64, 0)
         self.stored_eu = int(stored_eu)
         self.eu_capacity = int(eu_capacity)
-        self.eu_input_avg = 2048.0
-        self.eu_output_avg = 0.0
+        self.eu_input_avg = float(eu_input_avg)
+        self.eu_output_avg = float(eu_output_avg)
+        self.passive_loss_per_tick = int(passive_loss_per_tick)
+        self.recipe_eu_per_tick = int(recipe_eu_per_tick)
+        self.maintenance_problems = int(maintenance_problems)
+        self.efficiency = float(efficiency)
+        self.wireless_mode = bool(wireless_mode)
+        self.wireless_eu = int(wireless_eu)
+        self.simulate_eu_dynamics = bool(simulate_eu_dynamics)
+        self.completed_recipes: int = 0
         self.input_voltage = 8192
         self.output_voltage = 0
         self.output_amperage = 1
@@ -55,11 +72,7 @@ class GTMachineSimulator(SchemaBackedComponent):
         self.work_max_progress = int(work_max_progress)
         self.circuit_config = -1
 
-        self.sensor_information: List[str] = [
-            f"Progress: {self.work_progress // 20} s / {self.work_max_progress // 20} s",
-            f"Stored Energy: {self.stored_eu:,} EU / {self.eu_capacity:,} EU",
-            "Problems: §c0§r Efficiency: §a100.00%§r",
-        ]
+        self._custom_sensor_information: Optional[List[str]] = None
         self.parameters: Dict[Any, float] = {i: 0.0 for i in range(20)}
         self.battery_charges: Dict[int, Tuple[int, int]] = {
             1: (1000000, 1000000),
@@ -68,11 +81,59 @@ class GTMachineSimulator(SchemaBackedComponent):
             4: (1000000, 1000000),
         }
 
+    @property
+    def is_lsc(self) -> bool:
+        lower = self.machine_name.lower()
+        return "supercapacitor" in lower or "lapotronic" in lower or "lsc" in lower
+
+    @property
+    def sensor_information(self) -> List[str]:
+        if self._custom_sensor_information is not None:
+            return list(self._custom_sensor_information)
+        if self.is_lsc:
+            return [
+                "Operational Data:",
+                f"EU Stored: {self.stored_eu:,} EU",
+                f"EU Capacity: {self.eu_capacity:,} EU",
+                f"Total Capacity: {self.eu_capacity:,} EU",
+                f"Passive Loss: {self.passive_loss_per_tick:,} EU/t",
+                f"EU In: {int(self.eu_input_avg):,} EU/t",
+                f"EU Out: {int(self.eu_output_avg):,} EU/t",
+                f"Avg EU In: {int(self.eu_input_avg):,} (last 5 seconds)",
+                f"Avg EU Out: {int(self.eu_output_avg):,} (last 5 seconds)",
+                f"Maintenance Status: {'Working Perfectly' if self.maintenance_problems == 0 else f'{self.maintenance_problems} Problems'}",
+                f"Wireless Mode: {'Enabled' if self.wireless_mode else 'Disabled'}",
+                f"Total Wireless EU: {self.wireless_eu:,} EU",
+            ]
+        return [
+            f"Progress: {self.work_progress // 20} s / {self.work_max_progress // 20} s",
+            f"Stored Energy: {self.stored_eu:,} EU / {self.eu_capacity:,} EU",
+            f"Problems: §c{self.maintenance_problems}§r Efficiency: §a{self.efficiency:.2f}%§r",
+            f"Probably uses: {self.recipe_eu_per_tick:,} EU/t",
+            f"EU In: {int(self.eu_input_avg):,} EU/t | EU Out: {int(self.eu_output_avg):,} EU/t",
+        ]
+
+    @sensor_information.setter
+    def sensor_information(self, value: Optional[List[str]]) -> None:
+        self._custom_sensor_information = [str(x) for x in value] if value is not None else None
+
     def on_tick(self, current_tick: int) -> None:
+        if self.is_lsc or self.simulate_eu_dynamics or self.passive_loss_per_tick > 0:
+            net_delta = int(round(self.eu_input_avg - self.eu_output_avg)) - self.passive_loss_per_tick
+            if self.work_allowed and self.has_work and self.recipe_eu_per_tick > 0:
+                net_delta -= self.recipe_eu_per_tick
+            self.stored_eu = max(0, min(self.eu_capacity, self.stored_eu + net_delta))
+            if self.wireless_mode and net_delta > 0 and self.stored_eu >= self.eu_capacity:
+                self.wireless_eu += net_delta
+
         if self.work_allowed and self.has_work and self.work_max_progress > 0:
+            if self.recipe_eu_per_tick > 0 and self.stored_eu <= 0 and self.eu_input_avg < self.recipe_eu_per_tick:
+                # Insufficient power to advance recipe progress
+                return
             self.work_progress += 1
             if self.work_progress >= self.work_max_progress:
                 self.work_progress = 0
+                self.completed_recipes += 1
 
     # BaseGregTechEnergy
     def _impl_getAverageElectricInput(self) -> float:

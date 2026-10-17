@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 import math
 from typing import Any, Callable, Dict, List, Optional, Tuple
 import unicodedata
@@ -18,6 +19,16 @@ from .vfs import VirtualFileSystem
 def any_lua_type(value: Any) -> Optional[str]:
     """Return the Lua type name of a Lupa object across Lua 5.3, 5.2, and 5.4 runtimes."""
     return lua53_type(value) or lua52_type(value) or lua54_type(value)
+
+
+def _strict_lua_attribute_filter(obj: Any, attr_name: Any, is_setting: bool) -> Any:
+    """Block Lua access to private/dunder Python attributes, attribute mutation, and raw function attributes."""
+    name = str(attr_name)
+    if is_setting or name.startswith("_"):
+        raise AttributeError(f"Sandbox access denied to Python attribute {name!r}")
+    if inspect.isfunction(obj) or inspect.ismethod(obj) or inspect.isbuiltin(obj):
+        raise AttributeError(f"Sandbox access denied to Python callable attribute {name!r}")
+    return attr_name
 
 
 # OpenComputers default RAM tier sizes in KiB (1 = T1, 2 = T1.5, 3 = T2, 4 = T2.5, 5 = T3, 6 = T3.5)
@@ -64,6 +75,21 @@ do
   _ = require("sh").expand
   _ = require("transforms").sub
 
+  -- Route event.timer / event.listen callback errors to /tmp/event.log, stderr, and the host error tracker
+  local orig_event_onError = event.onError
+  event.onError = function(message)
+    local msg_str = tostring(message)
+    if orig_event_onError then
+      pcall(orig_event_onError, msg_str)
+    end
+    if io.stderr then
+      pcall(io.stderr.write, io.stderr, "[event.onError] " .. msg_str .. "\n")
+    end
+    if __oc_on_event_error then
+      __oc_on_event_error(msg_str)
+    end
+  end
+
   _G.computer = computer
   _G.component = component
   _G.unicode = unicode
@@ -91,7 +117,19 @@ do
 
   while true do
     local sig = table.pack(__oc_raw_pull(0))
-    if sig[1] == "__host_exec" then
+    if sig[1] == "__host_interactive_shell" then
+      while true do
+        local result, reason = xpcall(require("shell").getShell(), function(msg)
+          return tostring(msg) .. "\n" .. debug.traceback()
+        end)
+        if not result then
+          io.stderr:write((reason ~= nil and tostring(reason) or "unknown error") .. "\n")
+          io.write("Press any key to continue.\n")
+          os.sleep(0.5)
+          require("event").pull("key")
+        end
+      end
+    elseif sig[1] == "__host_exec" then
       local code = sig[2]
       local chunk_name = sig[3] or "=script.lua"
       local fn, err = load(code, chunk_name, "t", _G)
@@ -108,21 +146,22 @@ end
 
 
 class OCMachineHost:
-    """Hosts and drives OpenComputers' real `machine.lua`, `bios.lua`, and OpenOS inside Lupa Lua 5.3 / 5.2."""
+    """Hosts and drives OpenComputers' real `machine.lua`, `bios.lua`, and OpenOS inside Lupa Lua 5.2 / 5.3."""
 
     def __init__(
         self,
         sandbox: Any,
-        architecture: str = "Lua 5.3",
+        architecture: str = "Lua 5.2",
         ram_tier: int = 6,
         cpu_tier: int = 3,
         allow_bytecode: bool = False,
         allow_gc: bool = False,
         timeout: float = 5.0,
-        enforce_call_budget: bool = False,
+        enforce_call_budget: bool = True,
+        ram_scale_for_64bit: float = 1.8,
     ) -> None:
         self.sandbox = sandbox
-        self.architecture = str(architecture or "Lua 5.3")
+        self.architecture = str(architecture or "Lua 5.2")
         if self.architecture not in ("Lua 5.3", "Lua 5.2"):
             raise ValueError(f"Unsupported Lua architecture: {self.architecture!r} (expected 'Lua 5.3' or 'Lua 5.2')")
         self.ram_tier = max(1, min(len(RAM_SIZES_KB), int(ram_tier)))
@@ -131,12 +170,14 @@ class OCMachineHost:
         self.allow_gc = bool(allow_gc)
         self.timeout = float(timeout)
         self.enforce_call_budget = bool(enforce_call_budget)
+        self.ram_scale_for_64bit = max(1.0, float(ram_scale_for_64bit))
 
         self.total_memory_bytes: int = RAM_SIZES_KB[self.ram_tier - 1] * 1024
         self.call_budget_max: float = CPU_CALL_BUDGETS.get(self.cpu_tier, 1.5)
         self.call_budget_remaining: float = self.call_budget_max
-        # Each call to computer.realTime() advances virtual CPU time by 0.006s (10 iterations for 0.05s bogomips)
-        self.cpu_time_step_per_check: float = 0.006
+        # Used only during initial calcHookInterval() bogomips calibration before baseline yield
+        self.cpu_time_step_per_check: float = 0.01
+        self._in_bogomips: bool = True
 
         self.boot_address: str = self.sandbox.vfs.root_address
         self.users_list: List[str] = ["player"]
@@ -148,10 +189,13 @@ class OCMachineHost:
         self.tmp_vfs.root_address = self.sandbox.vfs.tmp_address
 
         runtime_cls = Lua52Runtime if self.architecture == "Lua 5.2" else Lua53Runtime
-        # Give VM overhead headroom for machine.lua + OpenOS boot, then tighten after baseline yield
-        self._vm_overhead_bytes: int = 2 * 1024 * 1024
+        # Give VM overhead headroom for machine.lua + OpenOS boot, then tighten after boot against baseline
+        self._vm_overhead_bytes: int = 4 * 1024 * 1024
         self.lua = runtime_cls(
             unpack_returned_tuples=True,
+            register_eval=False,
+            register_builtins=False,
+            attribute_filter=_strict_lua_attribute_filter,
             max_memory=self.total_memory_bytes + self._vm_overhead_bytes,
         )
         self._baseline_memory: int = 0
@@ -160,6 +204,8 @@ class OCMachineHost:
         self._last_exec_result: Optional[Tuple[bool, Tuple[Any, ...]]] = None
         self._booted: bool = False
         self._in_sync_call: bool = False
+        self._interactive_mode: bool = False
+        self._interactive_wait_deadline: float = math.inf
 
     @property
     def scheduler(self) -> DeterministicScheduler:
@@ -174,8 +220,9 @@ class OCMachineHost:
         return self.sandbox.jar_loader
 
     def free_memory(self) -> int:
-        used = self.lua.get_memory_used() - self._baseline_memory
-        return max(0, self.total_memory_bytes - max(0, used))
+        used_raw = max(0, self.lua.get_memory_used() - self._baseline_memory)
+        used_scaled = int(used_raw / self.ram_scale_for_64bit)
+        return max(0, self.total_memory_bytes - used_scaled)
 
     def total_memory(self) -> int:
         return self.total_memory_bytes
@@ -188,15 +235,19 @@ class OCMachineHost:
         init_src = self.jar_loader.read_asset_text("loot/openos/init.lua")
         if not init_src:
             raise RuntimeError("Missing OpenOS /init.lua in OpenComputers assets")
-        # Patch /init.lua to capture raw computer.pullSignal before event.lua wraps it,
-        # and enter the host runner loop after boot.lua finishes all /boot/*.lua scripts.
+        # Patch /init.lua to capture raw computer.pullSignal and one-shot host hooks in local upvalues
+        # before event.lua or any user script runs, so _G / _ENV never expose host callbacks.
         marker = "while true do\n  local result, reason = xpcall(require(\"shell\").getShell()"
-        patched_init = (
+        header = (
             "local __oc_raw_pull = computer.pullSignal\n"
-            + init_src.replace(
-                marker,
-                OPENOS_INIT_RUNNER_PATCH + "\n" + marker,
-            )
+            "local __oc_take_hooks = computer.__oc_take_host_hooks\n"
+            "computer.__oc_take_host_hooks = nil\n"
+            "local __oc_record_result, __oc_on_event_error = __oc_take_hooks()\n"
+            "__oc_take_hooks = nil\n"
+        )
+        patched_init = header + init_src.replace(
+            marker,
+            OPENOS_INIT_RUNNER_PATCH + "\n" + marker,
         )
         self.vfs.write_file("/init.lua", patched_init)
 
@@ -606,7 +657,9 @@ class OCMachineHost:
         comp_tbl["uptime"] = lambda: self.scheduler.uptime()
 
         def _real_time() -> float:
-            return self.scheduler.advance_cpu_time(self.cpu_time_step_per_check)
+            if self._in_bogomips:
+                return self.scheduler.advance_cpu_time(self.cpu_time_step_per_check)
+            return self.scheduler.get_real_time()
 
         comp_tbl["realTime"] = _real_time
         comp_tbl["energy"] = lambda: float(self.sandbox.energy)
@@ -901,20 +954,53 @@ local function checkDeadline(event)
         self._machine_co = co_factory(fn)
 
         # First resume: runs `calcHookInterval()` and yields at the baseline yield before `bootstrap()`
+        self._in_bogomips = True
         ok, res = self._resume_machine()
+        self._in_bogomips = False
         if not ok:
             raise RuntimeError(f"machine.lua failed during initialization: {res}")
 
+        # Record memory baseline right after machine.lua loads (before bios.lua / OpenOS boot)
+        # so OpenOS kernel/boot libraries count against the RAM tier just like in-game OpenComputers.
+        self.lua.execute('collectgarbage("collect")')
+        self._baseline_memory = self.lua.get_memory_used()
+
         self._sandbox_env = g["__oc_machine_sandbox"]
 
-        # Install runner result callback inside sandbox_env
+        # Provide one-shot host hooks consumed into local upvalues at line 1 of /init.lua
         def _record_result(success: bool, *vals: Any) -> None:
             self._last_exec_result = (bool(success), vals)
 
-        self._sandbox_env["__oc_record_result"] = _record_result
-        # Enforce WP2 security inside sandbox_env
+        def _on_event_error(message: Any) -> None:
+            msg_str = str(message)
+            existing_tmp = self.tmp_vfs.read_file("/event.log") or ""
+            self.tmp_vfs.write_file("/event.log", existing_tmp + msg_str + "\n")
+            existing_root_tmp = self.vfs.read_file("/tmp/event.log") or ""
+            self.vfs.write_file("/tmp/event.log", existing_root_tmp + msg_str + "\n")
+            self.scheduler.record_event_error(msg_str)
+
+        hooks_taken = False
+        hook_wrapper = self.lua.eval(
+            """
+            function(rec_fn, err_fn)
+              return function(...) return rec_fn(...) end, function(msg) return err_fn(msg) end
+            end
+            """
+        )
+        lua_rec_fn, lua_err_fn = hook_wrapper(_record_result, _on_event_error)
+
+        def _take_host_hooks() -> Tuple[Any, Any]:
+            nonlocal hooks_taken
+            if hooks_taken:
+                return (None, None)
+            hooks_taken = True
+            return (lua_rec_fn, lua_err_fn)
+
+        self._sandbox_env["computer"]["__oc_take_host_hooks"] = _take_host_hooks
+        # Enforce WP2 security inside sandbox_env: never place __oc_record_result or __oc_bridge in _G
         self._sandbox_env["python"] = None
         self._sandbox_env["__oc_bridge"] = None
+        self._sandbox_env["__oc_record_result"] = None
         if self._sandbox_env["string"] is not None:
             self._sandbox_env["string"]["dump"] = None
 
@@ -932,10 +1018,15 @@ local function checkDeadline(event)
         else:
             raise RuntimeError("OpenOS boot exceeded 500 yield steps without reaching runlevel 1")
 
+        # Ensure __oc_take_host_hooks is removed from sandbox computer table
+        self._sandbox_env["computer"]["__oc_take_host_hooks"] = None
+
         # Run a full Lua GC cycle after OpenOS boot and tighten the VM memory limit to the configured RAM tier
+        # scaled by ramScaleFor64Bit (1.8 in GTNH OpenComputers.cfg) from the pre-OpenOS machine.lua baseline.
         self.lua.execute('collectgarbage("collect")')
-        self._baseline_memory = self.lua.get_memory_used()
-        self.lua.set_max_memory(self._baseline_memory + self.total_memory_bytes)
+        self.lua.set_max_memory(
+            self._baseline_memory + int(self.total_memory_bytes * self.ram_scale_for_64bit)
+        )
 
         # Wrap `print` and `io.write` so `sandbox.stdout_lines` also captures printed lines
         self.lua.execute(
@@ -1101,3 +1192,94 @@ local function checkDeadline(event)
         if len(vals) == 1:
             return vals[0]
         return vals
+
+    # -------------------------------------------------------------------------
+    # Interactive OpenOS `/bin/sh.lua` shell & live event loop stepping
+    # -------------------------------------------------------------------------
+
+    def _drain_sync_calls(self, ok: bool, yielded: Any) -> Tuple[bool, Any]:
+        """Execute any synchronous component call closures yielded by `machine.lua`."""
+        while ok and any_lua_type(yielded) == "function":
+            self.scheduler.advance_ticks(1)
+            self.reset_call_budget()
+            self._in_sync_call = True
+            try:
+                sync_res = yielded()
+            finally:
+                self._in_sync_call = False
+            if isinstance(sync_res, tuple):
+                ok, yielded = self._resume_machine(*sync_res)
+            elif sync_res is not None:
+                ok, yielded = self._resume_machine(sync_res)
+            else:
+                ok, yielded = self._resume_machine()
+            if not ok:
+                raise RuntimeError(f"OpenComputers machine error: {yielded}")
+        return ok, yielded
+
+    def _update_interactive_deadline(self, yielded: Any) -> None:
+        if isinstance(yielded, bool):
+            self.sandbox.is_shutdown = True
+            self.sandbox.reboot_requested = bool(yielded)
+            self._interactive_wait_deadline = math.inf
+        elif isinstance(yielded, (int, float)):
+            sec = max(0.0, float(yielded))
+            self._interactive_wait_deadline = (
+                math.inf if math.isinf(sec) else (self.scheduler.uptime() + sec)
+            )
+        else:
+            self._interactive_wait_deadline = math.inf
+
+    def start_interactive_shell(self) -> None:
+        """Transition the booted OpenOS instance into the interactive `/bin/sh.lua` shell prompt."""
+        if not self._booted:
+            self.boot()
+        if self._interactive_mode:
+            return
+
+        self._interactive_mode = True
+        self.reset_call_budget()
+        ok, yielded = self._resume_machine("__host_interactive_shell")
+        if not ok:
+            raise RuntimeError(f"OpenComputers interactive shell failed to start: {yielded}")
+        ok, yielded = self._drain_sync_calls(ok, yielded)
+        self._update_interactive_deadline(yielded)
+        # Step a few ticks so sh.lua finishes printing the prompt and parks on term.read()
+        for _ in range(5):
+            if not self.scheduler.signal_queue and self._interactive_wait_deadline > self.scheduler.uptime():
+                break
+            self.step_interactive_tick()
+
+    def step_interactive_tick(self, max_signal_burst: int = 32) -> bool:
+        """Advance the interactive OpenOS machine by 1 virtual tick and process pending signals."""
+        if not self._interactive_mode:
+            self.start_interactive_shell()
+        if self.sandbox.is_shutdown or self._machine_co["status"]() == "dead":
+            return False
+
+        self.reset_call_budget()
+        processed = 0
+        while processed < max_signal_burst:
+            if self.sandbox.is_shutdown or self._machine_co["status"]() == "dead":
+                return False
+            if self.scheduler.signal_queue:
+                sig_name, sig_args = self.scheduler.signal_queue.popleft()
+                lua_args = [self.sandbox.python_to_lua(a) for a in sig_args]
+                ok, yielded = self._resume_machine(sig_name, *lua_args)
+                if not ok:
+                    raise RuntimeError(f"OpenComputers machine error: {yielded}")
+                ok, yielded = self._drain_sync_calls(ok, yielded)
+                self._update_interactive_deadline(yielded)
+                processed += 1
+            elif self.scheduler.uptime() >= self._interactive_wait_deadline:
+                ok, yielded = self._resume_machine()
+                if not ok:
+                    raise RuntimeError(f"OpenComputers machine error: {yielded}")
+                ok, yielded = self._drain_sync_calls(ok, yielded)
+                self._update_interactive_deadline(yielded)
+                processed += 1
+            else:
+                break
+
+        self.scheduler.advance_ticks(1)
+        return not self.sandbox.is_shutdown

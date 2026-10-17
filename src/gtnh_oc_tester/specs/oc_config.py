@@ -16,13 +16,14 @@ BUNDLED_APP_CONF_PATH = Path(__file__).parent / "data" / "oc_assets" / "applicat
 class OCMachineConfig:
     """Locked GTNH 2.9 OpenComputers configuration and hardware tier parameters."""
 
-    architecture: str = "Lua 5.3"
-    default_lua53: bool = True
+    architecture: str = "Lua 5.2"
+    default_lua53: bool = False
     enable_lua53: bool = True
     enable_lua54: bool = False
     timeout: float = 5.0
     call_budgets: Tuple[float, float, float] = (0.5, 1.0, 1.5)
     ram_sizes_kb: Tuple[int, int, int, int, int, int] = (192, 256, 384, 512, 768, 1024)
+    ram_scale_for_64bit: float = 1.8
     max_signal_queue_size: int = 1024
     eeprom_size: int = 4096
     eeprom_data_size: int = 256
@@ -95,6 +96,7 @@ def _parse_hocon_config_text(text: str) -> Dict[str, Any]:
 
     scalar_patterns = {
         "timeout": (r"\btimeout\s*[:=]\s*([-+]?\d*\.?\d+)", float),
+        "ram_scale_for_64bit": (r"\bramScaleFor64Bit\s*[:=]\s*([-+]?\d*\.?\d+)", float),
         "max_signal_queue_size": (r"\bmaxSignalQueueSize\s*[:=]\s*(\d+)", int),
         "eeprom_size": (r"\beepromSize\s*[:=]\s*(\d+)", int),
         "eeprom_data_size": (r"\beepromDataSize\s*[:=]\s*(\d+)", int),
@@ -141,12 +143,11 @@ def _parse_hocon_config_text(text: str) -> Dict[str, Any]:
 def load_oc_config(path: Optional[Union[str, Path]] = None, **overrides: Any) -> OCMachineConfig:
     """Load an `OCMachineConfig` from `OpenComputers.cfg` or `application.conf`.
 
-    Preserves the locked GTNH 2.9 defaults (`default_lua53=True` and
-    `max_signal_queue_size=1024`) when loading bundled configuration files
-    unless explicitly overridden by a custom config file or caller keyword overrides.
+    Respects the parsed `defaultLua53` (`false` in GTNH `OpenComputers.cfg`, giving
+    `"Lua 5.2"` by default) and `maxSignalQueueSize` (`1024` in `OpenComputers.cfg`,
+    `256` in `application.conf`, or any value from a custom config file).
     """
     values: Dict[str, Any] = {}
-    is_custom_file = False
 
     if path is not None:
         cfg_path = Path(path)
@@ -154,14 +155,6 @@ def load_oc_config(path: Optional[Union[str, Path]] = None, **overrides: Any) ->
             raise FileNotFoundError(f"OpenComputers config file not found: {cfg_path}")
         raw_text = cfg_path.read_text(encoding="utf-8", errors="replace")
         values.update(_parse_hocon_config_text(raw_text))
-        try:
-            resolved = cfg_path.resolve()
-            is_custom_file = resolved not in (
-                BUNDLED_CFG_PATH.resolve(),
-                BUNDLED_APP_CONF_PATH.resolve(),
-            )
-        except OSError:
-            is_custom_file = True
     else:
         if BUNDLED_APP_CONF_PATH.exists():
             values.update(
@@ -176,18 +169,14 @@ def load_oc_config(path: Optional[Union[str, Path]] = None, **overrides: Any) ->
                 )
             )
 
-    if not is_custom_file:
-        # Locked GTNH 2.9 defaults
-        values["default_lua53"] = True
-        values["max_signal_queue_size"] = 1024
-
-    if "default_lua53" in values and "architecture" not in overrides and "architecture" not in values:
+    if "default_lua53" in values and overrides.get("architecture") is None and "architecture" not in values:
         values["architecture"] = "Lua 5.3" if values["default_lua53"] else "Lua 5.2"
 
     valid_fields = {f.name for f in fields(OCMachineConfig)}
     for k, v in overrides.items():
         if k not in valid_fields:
             raise TypeError(f"Unknown OCMachineConfig parameter: {k!r}")
-        values[k] = v
+        if v is not None:
+            values[k] = v
 
     return OCMachineConfig(**values)

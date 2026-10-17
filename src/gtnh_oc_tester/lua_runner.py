@@ -189,10 +189,11 @@ class LuaSpecRunner:
         self,
         jar_path: Optional[str | Path] = None,
         jar_version: str = "1.12.64-GTNH",
-        lua_version: str = "5.3",
+        lua_version: str = "5.2",
         cpu_tier: int = 3,
         ram_tier: int = 6,
         oc_config: Optional[Any] = None,
+        enforce_call_budget: bool = True,
         dag_output_dir: Optional[str | Path] = None,
     ) -> None:
         self.jar_path = jar_path
@@ -201,6 +202,7 @@ class LuaSpecRunner:
         self.cpu_tier = cpu_tier
         self.ram_tier = ram_tier
         self.oc_config = oc_config
+        self.enforce_call_budget = bool(enforce_call_budget)
         self.dag_output_dir = Path(dag_output_dir) if dag_output_dir else None
         self.harness_path = Path(__file__).resolve().parent / "lua_harness" / "test_harness.lua"
         self.current_env: Optional[OCEnvironment] = None
@@ -214,6 +216,7 @@ class LuaSpecRunner:
             cpu_tier=self.cpu_tier,
             ram_tier=self.ram_tier,
             oc_config=self.oc_config,
+            enforce_call_budget=self.enforce_call_budget,
         )
         self.current_env = env
 

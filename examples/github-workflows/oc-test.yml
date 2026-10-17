@@ -26,7 +26,11 @@ jobs:
       - name: Install Graphviz, SDL2, and gtnh-oc-tester
         run: |
           sudo apt-get update -qq && sudo apt-get install -y -qq graphviz libsdl2-2.0-0
-          pip install gtnh-oc-tester
+          pip install "gtnh-oc-tester[window] @ git+https://github.com/tjmeltesen/gtnh-oc-tester.git"
+
+      - name: Validate GTNH 2.9 Component Dump Signatures
+        run: |
+          python -c "from gtnh_oc_tester import validate_simulator_dumps; r = validate_simulator_dumps(); assert r['valid'], r"
 
       - name: Run Python and Pure-Lua OpenComputers Test Suites (Lua ${{ matrix.lua-version }})
         run: |

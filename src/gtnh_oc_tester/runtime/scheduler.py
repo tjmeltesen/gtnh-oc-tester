@@ -5,6 +5,8 @@ from __future__ import annotations
 from collections import deque
 from dataclasses import dataclass
 import math
+import time
+import traceback
 from typing import Any, Callable, Deque, Dict, List, Optional, Tuple
 
 
@@ -22,7 +24,7 @@ class ScheduledTimer:
 
 
 class DeterministicScheduler:
-    """Virtual 20-TPS clock, 1024-bounded signal queue, CPU time tracker, and timer dispatcher."""
+    """Virtual 20-TPS clock, configurable bounded signal queue, CPU wall-clock tracker, and timer dispatcher."""
 
     TICKS_PER_SECOND = 20
 
@@ -30,16 +32,21 @@ class DeterministicScheduler:
         self,
         max_signal_queue_size: int = 1024,
         max_idle_ticks: int = 2000,
+        raise_on_event_error: bool = False,
     ) -> None:
         self.current_tick: int = 0
         self.max_signal_queue_size: int = int(max_signal_queue_size)
         self.max_idle_ticks: int = int(max_idle_ticks)
+        self.raise_on_event_error: bool = bool(raise_on_event_error)
         self._cpu_time_offset: float = 0.0
+        self._slice_start_perf: float = time.perf_counter()
         self.signal_queue: Deque[Tuple[str, Tuple[Any, ...]]] = deque()
         self.listeners: Dict[str, List[Callable[..., Any]]] = {}
         self.timers: Dict[int, ScheduledTimer] = {}
         self._next_timer_id: int = 1
         self.tick_hooks: List[Callable[[int], None]] = []
+        self.event_errors: List[str] = []
+        self.on_event_error: List[Callable[[str], None]] = []
         self.on_signal_Wait: List[
             Callable[[Optional[str], Optional[float], Optional[Tuple[str, Tuple[Any, ...]]]], None]
         ] = []
@@ -49,18 +56,31 @@ class DeterministicScheduler:
 
     @property
     def real_time(self) -> float:
-        return round(self.uptime() + self._cpu_time_offset, 6)
+        elapsed_wall = max(0.0, time.perf_counter() - self._slice_start_perf)
+        return round(self.uptime() + self._cpu_time_offset + elapsed_wall, 6)
 
     def get_real_time(self) -> float:
         return self.real_time
 
     def advance_cpu_time(self, seconds: float) -> float:
         self._cpu_time_offset += max(0.0, float(seconds))
-        return self.real_time
+        return round(self.uptime() + self._cpu_time_offset, 6)
 
     def sync_real_time(self) -> float:
         self._cpu_time_offset = 0.0
-        return self.real_time
+        self._slice_start_perf = time.perf_counter()
+        return round(self.uptime(), 6)
+
+    def record_event_error(self, message: str) -> None:
+        msg = str(message)
+        self.event_errors.append(msg)
+        for hook in list(self.on_event_error):
+            try:
+                hook(msg)
+            except Exception:
+                pass
+        if self.raise_on_event_error:
+            raise RuntimeError(f"Unhandled error in OpenComputers event/timer callback: {msg}")
 
     def add_tick_hook(self, fn: Callable[[int], None]) -> None:
         if fn not in self.tick_hooks:
@@ -134,7 +154,8 @@ class DeterministicScheduler:
                 continue
             try:
                 res = timer.callback()
-            except Exception:
+            except Exception as exc:
+                self.record_event_error(f"{exc}\n{traceback.format_exc()}")
                 res = False
             if res is False:
                 self.timers.pop(tid, None)
@@ -152,8 +173,8 @@ class DeterministicScheduler:
                 res = cb(sig_name, *sig_args)
                 if res is False:
                     self.unregister_listener(sig_name, cb)
-            except Exception:
-                pass
+            except Exception as exc:
+                self.record_event_error(f"{exc}\n{traceback.format_exc()}")
 
     def sleep(self, seconds: float = 0.05) -> None:
         ticks = max(1, int(round(max(0.0, float(seconds)) * self.TICKS_PER_SECOND)))
